@@ -15,6 +15,16 @@ from imitation_krab.config import MAX_REQUEST_BYTES
 
 
 class HealthCommandTests(unittest.TestCase):
+    def test_top_level_help_describes_liveness_probe(self):
+        output = StringIO()
+        with redirect_stdout(output), self.assertRaises(SystemExit) as raised:
+            main(["--help"])
+        self.assertEqual(raised.exception.code, 0)
+        self.assertIn(
+            "health probe daemon liveness without credentials",
+            " ".join(output.getvalue().split()),
+        )
+
     def run_health(self, *, body=b'{"status":"ok"}', version=__version__,
                    status=200, failure=None, human=False, server=None,
                    global_json=False):
