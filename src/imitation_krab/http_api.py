@@ -360,13 +360,14 @@ class KrabRequestHandler(BaseHTTPRequestHandler):
             and path[:2] == ["v1", "projects"]
             and path[3] in CLAIM_QUEUE_KINDS
         ):
-            self._require_query(query, {"status", "assignee"})
+            self._require_query(query, {"status", "assignee", "external_id"})
             return 200, self.server.service.list_work_claims(
                 actor,
                 path[2],
                 CLAIM_QUEUE_KINDS[path[3]],
                 status=query.get("status", [None])[0],
                 assignee=query.get("assignee", [None])[0],
+                external_id=query.get("external_id", [None])[0],
             )
         if (
             len(path) == 5

@@ -1,6 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/psyberone/imitation-krab/schemas/v1/claim-list.schema.json",
+  "description": "Project/kind-scoped issue or pull-request queue. Optional status, assignee and external_id query filters are combined with AND. external_id is a case-sensitive exact stored identifier (1-256 restricted ASCII characters); a match yields at most one claim and a miss yields an empty claims array. Response shape is unchanged.",
   "type": "object",
   "additionalProperties": false,
   "required": ["trusted_metadata", "claims"],

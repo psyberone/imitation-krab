@@ -118,6 +118,20 @@ def item_payload() -> dict:
 
 
 class CLIBehaviorTests(unittest.TestCase):
+    def test_external_id_queue_filter_request(self) -> None:
+        for command, queue in (("issues", "issues"), ("prs", "pull-requests")):
+            client = RecordingClient()
+            args = parse_args([
+                command, "--project", "project-one", "--external-id", "Owner/repo#7",
+                "--status", "under-review", "--assignee", "alice",
+            ])
+            with redirect_stdout(StringIO()):
+                _run_client(args, client)
+            self.assertEqual(client.calls, [(
+                "GET", f"/v1/projects/project-one/{queue}",
+                {"query": {"external_id": "Owner/repo#7", "status": "under_review", "assignee": "alice"}},
+            )])
+
     def test_session_help_uses_participant_handles(self) -> None:
         self.assertIn("handles", build_parser().format_help())
         output = StringIO()

@@ -89,6 +89,60 @@ class ServiceFixture(unittest.TestCase):
 
 
 class ServiceTests(ServiceFixture):
+    def test_external_id_queue_filter(self) -> None:
+        external_id = "Owner/repository#123"
+        for kind in ("issue", "pull_request"):
+            created = self.create_claim(
+                kind=kind, external_id=external_id, key=f"filter-create-{kind}"
+            ).payload["trusted_metadata"]
+            self.create_claim(
+                actor=self.mallory, project="project-two", kind=kind,
+                external_id=external_id, key=f"filter-other-{kind}",
+            )
+            self.service.claim_work(
+                self.bob, "project-one", kind, created["claim_id"],
+                {"expected_version": 1}, f"filter-claim-{kind}",
+            )
+            for filters, count in (
+                ({}, 1), ({"status": "claimed", "assignee": "bob"}, 1),
+                ({"status": "available"}, 0), ({"assignee": "alice"}, 0),
+            ):
+                result = self.service.list_work_claims(
+                    self.bob, "project-one", kind, external_id=external_id, **filters
+                )
+                self.assertEqual(result["trusted_metadata"]["count"], count)
+                self.assertEqual(len(result["claims"]), count)
+                if count:
+                    self.assertEqual(
+                        result["claims"][0]["trusted_metadata"]["claim_id"],
+                        created["claim_id"],
+                    )
+            for missing in ("owner/repository#123", "Owner/repository#12", "missing"):
+                self.assertEqual(self.service.list_work_claims(
+                    self.bob, "project-one", kind, external_id=missing
+                )["claims"], [])
+        self.create_claim(external_id="x" * 256, key="filter-boundary-0001")
+        self.assertEqual(len(self.service.list_work_claims(
+            self.bob, "project-one", "issue", external_id="x" * 256
+        )["claims"]), 1)
+        for project in ("project-two", "not-found"):
+            with self.assertRaises(ServiceError) as caught:
+                self.service.list_work_claims(
+                    self.bob, project, "issue", external_id=external_id
+                )
+            self.assertEqual(caught.exception.status, 404)
+
+    def test_external_id_queue_filter_rejects_malformed_input(self) -> None:
+        for value in (
+            "", "x" * 257, "has space", "é", "x\n", "x' OR 1=1", 1, [], {},
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(ServiceError) as caught:
+                    self.service.list_work_claims(
+                        self.bob, "project-one", "issue", external_id=value
+                    )
+                self.assertEqual(caught.exception.status, 400)
+
     def test_send_body_sources_preserve_server_utf8_byte_limit(self) -> None:
         for multibyte, boundary_body in (
             (False, ("a" * 1023 + "\n") * 16),

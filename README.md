@@ -563,11 +563,23 @@ krab --token-file ~/.config/imitation-krab/primary-dev.token \
 
 krab --token-file ~/.config/imitation-krab/primary-dev.token \
   prs --project imitation-krab --status active --assignee worker-one
+
+krab issues --project imitation-krab --external-id 'psyberone/imitation-krab#42'
+
+krab prs --project imitation-krab --external-id 'psyberone/imitation-krab#57' \
+  --status active --assignee worker-one
 ```
 
-Queue filters are optional exact matches. The only filters are one fixed
-status and one syntactically valid assignee handle; they may be combined and
-never widen project or claim-kind visibility.
+Queue filters are optional exact matches: one fixed status, one syntactically
+valid assignee handle, and one `--external-id EXACT`. They may be combined and
+never widen project or claim-kind visibility. External-ID matching uses the
+stored, case-sensitive identifier without partial matching, normalization, or
+URL parsing. A match returns at most one claim per project and kind; a miss
+returns a successful empty list. This filter does not change `claims --mine`.
+
+HTTP queue reads accept the same `external_id` query parameter. Percent-encode
+reserved characters, especially `#` (as `%23`), for example:
+`GET /v1/projects/imitation-krab/issues?external_id=psyberone%2Fimitation-krab%2342`.
 
 An agent can list all issue and pull-request claims currently assigned to its
 authenticated identity, including their current versions, in one CLI call:

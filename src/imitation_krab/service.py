@@ -161,6 +161,7 @@ class Service:
         *,
         status: str | None = None,
         assignee: str | None = None,
+        external_id: str | None = None,
     ) -> dict[str, Any]:
         project_key = self._valid_project_key(project_key)
         kind = self._valid_work_kind(kind)
@@ -168,6 +169,11 @@ class Service:
             status = self._valid_work_status(status)
         if assignee is not None:
             assignee = self._valid_handle(assignee)
+        if external_id is not None:
+            try:
+                external_id = validate_external_id(external_id)
+            except ValidationError as exc:
+                raise self._validation_error(exc) from exc
         conn = self.db.connect()
         try:
             project = self._project_membership(conn, actor["id"], project_key)
@@ -197,6 +203,7 @@ class Service:
                     END = ?
                   )
                   AND (? IS NULL OR assignee.handle = ?)
+                  AND (? IS NULL OR wc.external_id = ?)
                 ORDER BY
                     CASE
                         WHEN review.claim_id IS NOT NULL THEN 0
@@ -208,7 +215,10 @@ class Service:
                     wc.updated_at DESC,
                     wc.id
                 """,
-                (project["id"], kind, status, status, assignee, assignee),
+                (
+                    project["id"], kind, status, status, assignee, assignee,
+                    external_id, external_id,
+                ),
             ).fetchall()
         finally:
             conn.close()
