@@ -247,7 +247,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("init", help="initialize the private database and pepper")
 
-    health = sub.add_parser("health", help="check daemon health without credentials")
+    health = sub.add_parser("health", help="probe daemon liveness without credentials")
     health.add_argument(
         "--json", action="store_true", default=argparse.SUPPRESS,
         help="print machine-readable JSON",

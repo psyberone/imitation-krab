@@ -10,11 +10,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 from imitation_krab import __version__
-from imitation_krab.cli import main
+from imitation_krab.cli import build_parser, main
 from imitation_krab.config import MAX_REQUEST_BYTES
 
 
 class HealthCommandTests(unittest.TestCase):
+    def test_top_level_help_describes_health_as_liveness_probe(self):
+        help_text = " ".join(build_parser().format_help().split())
+        self.assertIn("health probe daemon liveness without credentials", help_text)
+
     def run_health(self, *, body=b'{"status":"ok"}', version=__version__,
                    status=200, failure=None, human=False, server=None,
                    global_json=False):
