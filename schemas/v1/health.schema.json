@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/psyberone/imitation-krab/schemas/v1/health.schema.json",
+  "description": "Successful krab health --json liveness output; server_version comes from the validated X-Krab-Version header, not the response body.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "server_version"],
+  "properties": {
+    "status": {"const": "ok"},
+    "server_version": {
+      "type": ["string", "null"],
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}(?![\\s\\S])"
+    }
+  }
+}

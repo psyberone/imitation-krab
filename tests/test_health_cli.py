@@ -63,6 +63,17 @@ class HealthCommandTests(unittest.TestCase):
                 self.assertNotIn("Authorization", request.kwargs["headers"])
                 connection.return_value.close.assert_called_once_with()
 
+    def test_connection_has_five_second_timeout(self):
+        result, _, error, connection = self.run_health()
+        self.assertEqual(result, 0, error)
+        self.assertEqual(connection.call_args.kwargs.get("timeout"), 5)
+
+    def test_response_read_is_bounded(self):
+        result, _, error, connection = self.run_health()
+        self.assertEqual(result, 0, error)
+        response = connection.return_value.getresponse.return_value
+        response.read.assert_called_once_with(MAX_REQUEST_BYTES + 1)
+
     def test_human_output_and_explicit_server(self):
         result, output, error, connection = self.run_health(
             human=True, server="http://127.0.0.1:9877"

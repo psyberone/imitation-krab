@@ -145,14 +145,19 @@ Explicit global `--server` and `--token-file` options override these defaults.
 
 ### Health probes
 
-Use `krab health` for a one-line daemon health check, or `krab health --json`
+Use `krab health` for a one-line daemon liveness probe, or `krab health --json`
 (also `krab --json health`) for supervisors and orchestration probes:
 
 ```console
 krab --server http://127.0.0.1:8765 health --json
 ```
 
-On success, JSON contains `{"status":"ok","server_version":"0.6.3"}`.
+This checks only that the daemon responds to the health endpoint. It does not
+establish database readiness, authentication, project access, or overall
+operability; it is not a readiness probe.
+
+On success, JSON contains `{"status":"ok","server_version":"0.6.3"}`,
+as defined by [`schemas/v1/health.schema.json`](schemas/v1/health.schema.json).
 `server_version` is the validated `X-Krab-Version` response header, or `null`
 for legacy servers that omit it. The probe honors `KRAB_SERVER` and `--server`,
 sends an unauthenticated `GET /v1/health`, never reads the token file, and does
@@ -160,10 +165,11 @@ not open, initialize, or migrate the local database or access its pepper.
 It uses a five-second socket timeout and a bounded response body. An unavailable
 server, non-200 response, malformed health JSON, or invalid version header
 produces a terminal-safe error on stderr and exit status 1; success exits 0.
-When a version-reporting client reaches an older server that has no version
-header, or a server reports a different version, the client prints one
-compatibility warning to stderr. Update the CLI and daemon together when adding
-commands.
+Human output reports the validated server version, or `unknown` when the header
+is absent. The health command does not compare versions or emit compatibility
+warnings. Authenticated API commands separately warn once when the server omits
+its version header or reports a different version. Update the CLI and daemon
+together when adding commands.
 
 The operational database defaults to
 `~/.local/state/imitation-krab/krab.db`, outside any agent workspace. Override
