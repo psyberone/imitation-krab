@@ -19,7 +19,7 @@ class HealthCommandTests(unittest.TestCase):
                    status=200, failure=None, human=False, server=None,
                    global_json=False):
         output, error = StringIO(), StringIO()
-        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+        with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             argv = ["--db", str(root / "state" / "db"),
                     "--pepper-file", str(root / "state" / "pepper"),
