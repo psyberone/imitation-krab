@@ -118,6 +118,40 @@ def item_payload() -> dict:
 
 
 class CLIBehaviorTests(unittest.TestCase):
+    def test_session_help_uses_participant_handles(self) -> None:
+        self.assertIn("handles", build_parser().format_help())
+        output = StringIO()
+        with redirect_stdout(output), self.assertRaises(SystemExit) as caught:
+            main(["session-create", "--help"])
+        self.assertEqual(caught.exception.code, 0)
+        self.assertIn("--participant HANDLE", output.getvalue())
+        self.assertIn("handle", output.getvalue())
+
+    def test_session_participant_id_fails_locally_before_client_creation(self) -> None:
+        for participants in (["usr_" + "a" * 32], ["alice", "usr_bad"]):
+            arguments = ["session-create", "--project", "project-one", "--label", "Review"]
+            for participant in participants:
+                arguments.extend(["--participant", participant])
+            output = StringIO()
+            with patch("imitation_krab.cli.APIClient") as client, redirect_stderr(output):
+                with self.assertRaises(SystemExit) as caught:
+                    main(arguments)
+            self.assertEqual(caught.exception.code, 2)
+            client.assert_not_called()
+            self.assertIn("--participant", output.getvalue())
+            self.assertIn("handle", output.getvalue())
+            self.assertIn("usr_", output.getvalue())
+
+    def test_send_help_documents_both_body_source_limits(self) -> None:
+        output = StringIO()
+        with redirect_stdout(output), self.assertRaises(SystemExit) as caught:
+            main(["send", "--help"])
+        self.assertEqual(caught.exception.code, 0)
+        for option in ("--body BODY", "--body-file BODY_FILE"):
+            description = output.getvalue().split(option)[-1].split("\n  --")[0]
+            self.assertIn("16 KiB", description)
+            self.assertIn("UTF-8", description)
+
     def test_human_item_output_exposes_effective_completion_policy(self) -> None:
         for policy, expected in (
             ("receipt", "receipt"),

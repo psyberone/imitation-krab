@@ -417,6 +417,10 @@ krab --token-file ~/.config/imitation-krab/primary-dev.token \
   --participant worker-one
 ```
 
+`--participant HANDLE` takes a project member's handle, such as `worker-one`,
+not a stable `usr_...` user ID. Repeat the option for each participant. The CLI
+rejects `usr_...` participants locally before sending a request.
+
 The response contains a server-generated session ID. Use it for every work
 item in that unit of work:
 
@@ -429,6 +433,12 @@ krab --token-file ~/.config/imitation-krab/primary-dev.token \
   --title "Review authentication changes" \
   --body-file request.txt
 ```
+
+Both `send --body` and `send --body-file` accept at most 16 KiB (16,384 bytes)
+of UTF-8 text. This is a byte limit, not a character limit: visible Unicode
+characters may take multiple bytes. A body exactly at the limit is accepted
+if it meets the other text constraints; a larger body is rejected by the server
+with `body exceeds 16384 UTF-8 bytes`. A file's trailing newline counts too.
 
 The worker can watch only its own private deliveries:
 
@@ -876,7 +886,7 @@ GitHub or permission to perform any external action.
 
 - Request body: 32 KiB
 - Incomplete request headers: 1-second connection deadline
-- Work-item body: 16 KiB
+- Work-item body: 16 KiB (16,384 UTF-8 bytes), shared by `--body` and `--body-file`
 - Status note: 4 KiB
 - Title: 512 UTF-8 bytes
 - Queue page: 100 events

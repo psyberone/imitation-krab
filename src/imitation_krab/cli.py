@@ -22,6 +22,7 @@ from .config import (
     CONTAINER_HOST,
     DEFAULT_HOST,
     DEFAULT_PORT,
+    MAX_BODY_BYTES,
     MAX_CLAIM_IMPORT_ENTRIES,
     MAX_REQUEST_BYTES,
     default_db_path,
@@ -380,11 +381,15 @@ def build_parser() -> argparse.ArgumentParser:
     sessions.add_argument("--project", required=True)
 
     session_create = sub.add_parser(
-        "session-create", help="create a scoped work session"
+        "session-create", help="create a scoped work session with participant handles"
     )
     session_create.add_argument("--project", required=True)
     session_create.add_argument("--label", required=True)
-    session_create.add_argument("--participant", action="append", required=True)
+    session_create.add_argument(
+        "--participant", metavar="HANDLE", type=_participant_handle,
+        action="append", required=True,
+        help="project member handle (not a usr_... ID); repeat for each participant",
+    )
 
     session_close = sub.add_parser(
         "session-close", help="close an empty/completed session"
@@ -496,12 +501,26 @@ def _add_mutation_retry_arg(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _participant_handle(value: str) -> str:
+    if value.startswith("usr_"):
+        raise argparse.ArgumentTypeError(
+            "use the project member's handle (for example, alice), not a usr_... ID"
+        )
+    return value
+
+
 def _add_text_source(
     parser: argparse.ArgumentParser, name: str, *, required: bool
 ) -> None:
     group = parser.add_mutually_exclusive_group(required=required)
-    group.add_argument(f"--{name}")
-    group.add_argument(f"--{name}-file", type=Path)
+    limit = (
+        f" (maximum {MAX_BODY_BYTES // 1024} KiB / {MAX_BODY_BYTES} UTF-8 bytes)"
+        if name == "body" else ""
+    )
+    group.add_argument(f"--{name}", help=f"{name} text{limit}")
+    group.add_argument(
+        f"--{name}-file", type=Path, help=f"read {name} text from a UTF-8 file{limit}"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
