@@ -118,6 +118,25 @@ def item_payload() -> dict:
 
 
 class CLIBehaviorTests(unittest.TestCase):
+    def test_receipt_send_and_explicit_handle_requests(self) -> None:
+        client = RecordingClient()
+        args = parse_args([
+            "send", "--project", "project-one", "--session", SESSION_ID,
+            "--to", "bob", "--title", "Verdict", "--body", "Reviewed",
+            "--completion-policy", "receipt",
+        ])
+        with redirect_stdout(StringIO()):
+            _run_client(args, client)
+        self.assertEqual(client.calls[0][2]["payload"]["completion_policy"], "receipt")
+        args = parse_args([
+            "status", ITEM_ID, "handled", "--project", "project-one",
+            "--session", SESSION_ID, "--expected-version", "1",
+        ])
+        with redirect_stdout(StringIO()):
+            _run_client(args, client)
+        self.assertEqual(client.calls[-1][2]["payload"],
+                         {"status": "closed.handled", "expected_version": 1})
+
     def test_release_version_is_0_6_4(self) -> None:
         self.assertEqual(__version__, "0.6.4")
 

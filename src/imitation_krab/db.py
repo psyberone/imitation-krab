@@ -19,7 +19,7 @@ from .config import MAX_DATABASE_BYTES, default_db_path, default_pepper_path
 from .sanitize import sanitize_text, validate_handle, validate_project_key
 
 TOKEN_RE = re.compile(r"^krab_(usr_[0-9a-f]{32})_([A-Za-z0-9_-]{43})$")
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 SCHEMA = """
@@ -137,6 +137,8 @@ CREATE TABLE IF NOT EXISTS items (
     title TEXT NOT NULL,
     body TEXT NOT NULL,
     risk_flags TEXT NOT NULL DEFAULT '[]',
+    completion_policy TEXT NOT NULL DEFAULT 'workflow'
+        CHECK (completion_policy IN ('workflow', 'receipt')),
     status TEXT NOT NULL CHECK (status IN (
         'open.pending',
         'open.in_progress',
@@ -144,13 +146,18 @@ CREATE TABLE IF NOT EXISTS items (
         'open.needs_changes',
         'open.approved',
         'closed.approved',
-        'closed.rejected'
+        'closed.rejected',
+        'closed.handled'
     )),
     version INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE (project_id, session_id, id),
     CHECK (creator_id <> recipient_id),
+    CHECK (
+        (completion_policy = 'workflow' AND status <> 'closed.handled')
+        OR (completion_policy = 'receipt' AND status IN ('open.pending', 'closed.handled'))
+    ),
     FOREIGN KEY (project_id, session_id, creator_id)
         REFERENCES session_members(project_id, session_id, user_id) ON DELETE RESTRICT,
     FOREIGN KEY (project_id, session_id, recipient_id)
@@ -247,6 +254,14 @@ WHEN NEW.work_claim_id IS NOT NULL
  )
 BEGIN
     SELECT RAISE(ABORT, 'work claim scope mismatch');
+END;
+
+CREATE TRIGGER IF NOT EXISTS items_completion_policy_immutable
+BEFORE UPDATE OF completion_policy ON items
+FOR EACH ROW
+WHEN NEW.completion_policy IS NOT OLD.completion_policy
+BEGIN
+    SELECT RAISE(ABORT, 'completion policy is immutable');
 END;
 
 CREATE TRIGGER IF NOT EXISTS items_work_claim_scope_project_update
@@ -553,16 +568,17 @@ class Database:
         version = rows[0]["version"]
         if version == SCHEMA_VERSION:
             return
-        if version not in {1, 2, 3, 4, 5}:
+        if version not in {1, 2, 3, 4, 5, 6}:
             raise DatabaseError("unsupported database schema version")
 
+        conn.execute("PRAGMA foreign_keys = OFF")
         try:
             conn.execute("BEGIN IMMEDIATE")
             locked_rows = conn.execute("SELECT version FROM schema_meta").fetchall()
             if len(locked_rows) != 1:
                 raise DatabaseError("database schema metadata is invalid")
             locked_version = locked_rows[0]["version"]
-            if locked_version not in {1, 2, 3, 4, 5, SCHEMA_VERSION}:
+            if locked_version not in {1, 2, 3, 4, 5, 6, SCHEMA_VERSION}:
                 raise DatabaseError("unsupported database schema version")
             if locked_version == 1:
                 for statement in MIGRATION_1_TO_2:
@@ -610,13 +626,66 @@ class Database:
                 for statement in MIGRATION_5_TO_6:
                     conn.execute(statement)
                 conn.execute(
-                    "UPDATE schema_meta SET version = ? WHERE version = 5",
-                    (SCHEMA_VERSION,),
+                    "UPDATE schema_meta SET version = 6 WHERE version = 5",
                 )
+                locked_version = 6
+            if locked_version == 6:
+                self._migrate_receipt_policy(conn)
+                conn.execute("UPDATE schema_meta SET version = 7 WHERE version = 6")
+            if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise DatabaseError("database migration violates foreign-key integrity")
             conn.commit()
         except Exception:
             conn.rollback()
             raise
+        finally:
+            conn.execute("PRAGMA foreign_keys = ON")
+
+    @staticmethod
+    def _migrate_receipt_policy(conn: sqlite3.Connection) -> None:
+        columns = [row["name"] for row in conn.execute("PRAGMA table_info(items)")]
+        if not columns or "completion_policy" in columns:
+            return
+        original = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'items'"
+        ).fetchone()["sql"]
+        dependents = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE tbl_name = 'items' "
+            "AND type IN ('index', 'trigger') AND sql IS NOT NULL"
+        ).fetchall()
+        rebuilt = re.sub(
+            r'CREATE TABLE\s+(?:IF NOT EXISTS\s+)?["`\[]?items["`\]]?',
+            "CREATE TABLE items_v7", original, count=1, flags=re.IGNORECASE,
+        )
+        rebuilt = rebuilt.replace("'closed.rejected'", "'closed.rejected', 'closed.handled'")
+        opening = rebuilt.index("(") + 1
+        rebuilt = (
+            rebuilt[:opening] + "completion_policy TEXT NOT NULL DEFAULT 'workflow' "
+            "CHECK (completion_policy IN ('workflow', 'receipt')), " + rebuilt[opening:]
+        )
+        policy = ""
+        if "status" in columns:
+            policy += (
+                ", CHECK ((completion_policy = 'workflow' AND status <> 'closed.handled') "
+                "OR (completion_policy = 'receipt' "
+                "AND status IN ('open.pending', 'closed.handled')))"
+            )
+        closing = rebuilt.rfind(")")
+        conn.execute(rebuilt[:closing] + policy + rebuilt[closing:])
+        names = ", ".join('"' + name.replace('"', '""') + '"' for name in columns)
+        conn.execute(f"INSERT INTO items_v7 ({names}) SELECT {names} FROM items")
+        conn.execute("DROP TABLE items")
+        conn.execute("ALTER TABLE items_v7 RENAME TO items")
+        for dependent in dependents:
+            conn.execute(dependent["sql"])
+        conn.execute("""
+            CREATE TRIGGER items_completion_policy_immutable
+            BEFORE UPDATE OF completion_policy ON items
+            FOR EACH ROW WHEN NEW.completion_policy IS NOT OLD.completion_policy
+            BEGIN
+                SELECT RAISE(ABORT, 'completion policy is immutable');
+            END
+            """)
 
     def backup(self, destination: Path | str) -> dict[str, Any]:
         """Create a consistent, private SQLite snapshot without overwriting."""
