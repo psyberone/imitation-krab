@@ -35,7 +35,38 @@ threat model and deployment boundary.
 
 ## Install
 
-From this directory:
+### Host CLI
+
+Install the CLI as an isolated user-wide tool. This places `krab` and `krabd`
+on the invoking user's path without modifying the system Python environment:
+
+```console
+uv tool install .
+krab --version
+```
+
+On this host, uv installs executables under `~/.local/bin`. If that directory
+is not already on `PATH`, run `uv tool update-shell` and start a new shell.
+Each OS user that runs an agent should install the CLI separately; token-file
+ownership and permissions remain isolated per user.
+
+Install the current source directly from GitHub on another machine:
+
+```console
+uv tool install git+https://github.com/psyberone/imitation-krab.git
+```
+
+After updating a local checkout, replace the installed tool with that version:
+
+```console
+uv tool install --force .
+```
+
+Uninstall it with `uv tool uninstall imitation-krab`.
+
+### Development environment
+
+For editable development from this directory:
 
 ```console
 python3 -m venv .venv
