@@ -38,6 +38,8 @@ STATUS_ALIASES = {
     "closed-rejected": "closed.rejected",
 }
 
+CLAIM_KIND_PATHS = {"issue": "issues", "pr": "pull-requests"}
+
 
 class ClientError(RuntimeError):
     pass
@@ -187,6 +189,40 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("projects", help="list authenticated user's projects")
 
+    issues = sub.add_parser("issues", help="list the project's issue claim queue")
+    issues.add_argument("--project", required=True)
+
+    pull_requests = sub.add_parser(
+        "prs", help="list the project's pull-request claim queue"
+    )
+    pull_requests.add_argument("--project", required=True)
+
+    claim_add = sub.add_parser(
+        "claim-add", help="register an issue or pull request as available work"
+    )
+    claim_add.add_argument("external_id")
+    _add_claim_scope_args(claim_add)
+
+    claim = sub.add_parser("claim", help="atomically claim work for yourself")
+    claim.add_argument("claim_id")
+    _add_claim_scope_args(claim)
+    claim.add_argument("--expected-version", type=int, required=True)
+
+    claim_release = sub.add_parser(
+        "claim-release", help="release your claim, or release one as project admin"
+    )
+    claim_release.add_argument("claim_id")
+    _add_claim_scope_args(claim_release)
+    claim_release.add_argument("--expected-version", type=int, required=True)
+
+    claim_status = sub.add_parser(
+        "claim-status", help="advance your claimed work to active or done"
+    )
+    claim_status.add_argument("claim_id")
+    claim_status.add_argument("status", choices=["active", "done"])
+    _add_claim_scope_args(claim_status)
+    claim_status.add_argument("--expected-version", type=int, required=True)
+
     sessions = sub.add_parser("sessions", help="list sessions in a project")
     sessions.add_argument("--project", required=True)
 
@@ -209,6 +245,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_scope_args(send)
     send.add_argument("--to", required=True)
     send.add_argument("--title", required=True)
+    send.add_argument("--claim", help="immutably link an issue or pull-request claim")
     _add_text_source(send, "body", required=True)
 
     queue = sub.add_parser("queue", help="read the authenticated user's private queue")
@@ -239,6 +276,11 @@ def build_parser() -> argparse.ArgumentParser:
 def _add_scope_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--project", required=True)
     parser.add_argument("--session", required=True)
+
+
+def _add_claim_scope_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--project", required=True)
+    parser.add_argument("--kind", choices=sorted(CLAIM_KIND_PATHS), required=True)
 
 
 def _add_text_source(
@@ -317,6 +359,43 @@ def _run_client(args: argparse.Namespace, client: APIClient) -> int:
     if command == "projects":
         result = client.request("GET", "/v1/projects")
         _emit(args, result, kind="projects")
+    elif command in {"issues", "prs"}:
+        queue = "issues" if command == "issues" else "pull-requests"
+        result = client.request(
+            "GET", f"/v1/projects/{_segment(args.project)}/{queue}"
+        )
+        _emit(args, result, kind="claims")
+    elif command == "claim-add":
+        result = client.request(
+            "POST",
+            _claim_queue_path(args),
+            payload={"external_id": args.external_id},
+        )
+        _emit(args, result, kind="claim")
+    elif command == "claim":
+        result = client.request(
+            "POST",
+            _claim_path(args) + "/claim",
+            payload={"expected_version": args.expected_version},
+        )
+        _emit(args, result, kind="claim")
+    elif command == "claim-release":
+        result = client.request(
+            "POST",
+            _claim_path(args) + "/release",
+            payload={"expected_version": args.expected_version},
+        )
+        _emit(args, result, kind="claim")
+    elif command == "claim-status":
+        result = client.request(
+            "PATCH",
+            _claim_path(args) + "/status",
+            payload={
+                "status": args.status,
+                "expected_version": args.expected_version,
+            },
+        )
+        _emit(args, result, kind="claim")
     elif command == "sessions":
         result = client.request(
             "GET", f"/v1/projects/{_segment(args.project)}/sessions"
@@ -338,10 +417,17 @@ def _run_client(args: argparse.Namespace, client: APIClient) -> int:
         _emit(args, result)
     elif command == "send":
         body = _text_argument(args, "body")
+        send_payload: dict[str, Any] = {
+            "to": args.to,
+            "title": args.title,
+            "body": body,
+        }
+        if args.claim is not None:
+            send_payload["claim_id"] = args.claim
         result = client.request(
             "POST",
             _scope_path(args) + "/items",
-            payload={"to": args.to, "title": args.title, "body": body},
+            payload=send_payload,
         )
         _emit(args, result, kind="item")
     elif command == "queue":
@@ -393,6 +479,17 @@ def _run_client(args: argparse.Namespace, client: APIClient) -> int:
 
 def _scope_path(args: argparse.Namespace) -> str:
     return f"/v1/projects/{_segment(args.project)}/sessions/{_segment(args.session)}"
+
+
+def _claim_queue_path(args: argparse.Namespace) -> str:
+    return (
+        f"/v1/projects/{_segment(args.project)}/"
+        f"{CLAIM_KIND_PATHS[args.kind]}"
+    )
+
+
+def _claim_path(args: argparse.Namespace) -> str:
+    return _claim_queue_path(args) + f"/{_segment(args.claim_id)}"
 
 
 def _segment(value: str) -> str:
@@ -562,6 +659,13 @@ def _emit(
             field="label",
         )
         return
+    if kind == "claims":
+        for claim in payload.get("claims", []):
+            _print_claim(claim)
+        return
+    if kind == "claim":
+        _print_claim(payload)
+        return
     if kind == "item":
         _print_item(payload)
         return
@@ -579,6 +683,11 @@ def _print_item(payload: dict[str, Any]) -> None:
         f"{meta['status']} v{meta['version']}"
     )
     print(f"  {meta['creator']['handle']} -> {meta['recipient']['handle']}")
+    if meta.get("work_claim") is not None:
+        work = meta["work_claim"]
+        print(
+            f"  linked {work['kind']} {work['external_id']} ({work['claim_id']})"
+        )
     flags = payload.get("content_risk_flags", [])
     if flags:
         print("  CONTENT WARNING: " + ", ".join(flags))
@@ -587,6 +696,16 @@ def _print_item(payload: dict[str, Any]) -> None:
     _print_untrusted(text.get("body", ""), [], field="body")
     for event in payload.get("history", []):
         _print_event(event)
+
+
+def _print_claim(payload: dict[str, Any]) -> None:
+    meta = payload["trusted_metadata"]
+    assignee = meta["assignee"]["handle"] if meta["assignee"] else "-"
+    print(
+        f"[{meta['project_key']}] {meta['kind']} {meta['external_id']} "
+        f"[{meta['status']}] v{meta['version']} assignee={assignee} "
+        f"{meta['claim_id']}"
+    )
 
 
 def _print_event(event: dict[str, Any]) -> None:
@@ -599,6 +718,11 @@ def _print_event(event: dict[str, Any]) -> None:
     if meta.get("to_status"):
         transition = f" {meta.get('from_status') or '-'} -> {meta['to_status']}"
     print(f"{scope}event#{meta['event_seq']} {meta['kind']} by {actor}{transition}")
+    if meta.get("work_claim") is not None:
+        work = meta["work_claim"]
+        print(
+            f"  linked {work['kind']} {work['external_id']} ({work['claim_id']})"
+        )
     flags = event.get("content_risk_flags", [])
     if flags:
         print("  CONTENT WARNING: " + ", ".join(flags))

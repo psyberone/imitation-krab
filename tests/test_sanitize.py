@@ -18,7 +18,13 @@ from imitation_krab.cli import (
     main,
 )
 from imitation_krab.config import CONTAINER_HOST, DEFAULT_PORT
-from imitation_krab.sanitize import ValidationError, sanitize_text, terminal_lines
+from imitation_krab.sanitize import (
+    ValidationError,
+    sanitize_text,
+    terminal_lines,
+    validate_external_id,
+    validate_object_id,
+)
 
 
 class SanitizeTests(unittest.TestCase):
@@ -28,6 +34,60 @@ class SanitizeTests(unittest.TestCase):
         backup = build_parser().parse_args(["admin", "backup", "/private/backup.db"])
         self.assertEqual(backup.admin_command, "backup")
         self.assertEqual(backup.destination, Path("/private/backup.db"))
+
+    def test_claim_commands_are_small_and_explicit(self) -> None:
+        issues = build_parser().parse_args(["issues", "--project", "project-one"])
+        self.assertEqual(issues.command, "issues")
+
+        add = build_parser().parse_args(
+            [
+                "claim-add",
+                "owner/repository#123",
+                "--project",
+                "project-one",
+                "--kind",
+                "pr",
+            ]
+        )
+        self.assertEqual(add.external_id, "owner/repository#123")
+        self.assertEqual(add.kind, "pr")
+
+        send = build_parser().parse_args(
+            [
+                "send",
+                "--project",
+                "project-one",
+                "--session",
+                "ses_" + "a" * 32,
+                "--to",
+                "bob",
+                "--title",
+                "Review",
+                "--body",
+                "Please review",
+                "--claim",
+                "clm_" + "b" * 32,
+            ]
+        )
+        self.assertEqual(send.claim, "clm_" + "b" * 32)
+
+    def test_external_ids_are_restricted_ascii_and_claim_ids_are_valid(self) -> None:
+        for value in ("123", "PROJ-123", "owner/repository#123", "repo:issue/123"):
+            with self.subTest(value=value):
+                self.assertEqual(validate_external_id(value), value)
+        for value in (
+            "",
+            "#123",
+            "owner/repo 123",
+            "owner/repo?x=1",
+            "owner/repo\x1b[2J",
+            "équipe/123",
+            "a" * 257,
+        ):
+            with self.subTest(value=repr(value)), self.assertRaises(ValidationError):
+                validate_external_id(value)
+        claim_id = "clm_" + "c" * 32
+        self.assertEqual(validate_object_id(claim_id, "clm"), claim_id)
 
     def test_container_bind_is_forwarded_only_when_explicit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

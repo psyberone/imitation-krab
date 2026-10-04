@@ -242,6 +242,98 @@ class HTTPAPITests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(data["error"]["code"], "validation_error")
 
+    def test_http_claim_queues_and_message_link(self) -> None:
+        issue_path = "/v1/projects/project-one/issues"
+        status, created, _ = self.request(
+            "POST",
+            issue_path,
+            self.alice_token,
+            {"external_id": "owner/repository#321"},
+            key="http-claim-create-0001",
+        )
+        self.assertEqual(status, 201, created)
+        claim_id = created["trusted_metadata"]["claim_id"]
+
+        status, rejected_assignment, _ = self.request(
+            "POST",
+            issue_path,
+            self.alice_token,
+            {
+                "external_id": "owner/repository#322",
+                "assignee": "bob",
+            },
+            key="http-claim-forged-assignment-0001",
+        )
+        self.assertEqual(status, 400, rejected_assignment)
+        self.assertEqual(rejected_assignment["error"]["code"], "unknown_fields")
+
+        status, issues, _ = self.request("GET", issue_path, self.bob_token)
+        self.assertEqual(status, 200, issues)
+        self.assertEqual(len(issues["claims"]), 1)
+        status, pull_requests, _ = self.request(
+            "GET", "/v1/projects/project-one/pull-requests", self.bob_token
+        )
+        self.assertEqual(status, 200, pull_requests)
+        self.assertEqual(pull_requests["claims"], [])
+
+        status, claimed, _ = self.request(
+            "POST",
+            f"{issue_path}/{claim_id}/claim",
+            self.bob_token,
+            {"expected_version": 1},
+            key="http-claim-take-0001",
+        )
+        self.assertEqual(status, 200, claimed)
+        self.assertEqual(claimed["trusted_metadata"]["assignee"]["handle"], "bob")
+
+        status, conflict, _ = self.request(
+            "POST",
+            f"{issue_path}/{claim_id}/claim",
+            self.alice_token,
+            {"expected_version": 1},
+            key="http-claim-take-0002",
+        )
+        self.assertEqual(status, 409, conflict)
+
+        status, active, _ = self.request(
+            "PATCH",
+            f"{issue_path}/{claim_id}/status",
+            self.bob_token,
+            {"status": "active", "expected_version": 2},
+            key="http-claim-active-0001",
+        )
+        self.assertEqual(status, 200, active)
+        self.assertEqual(active["trusted_metadata"]["status"], "active")
+
+        status, released, _ = self.request(
+            "POST",
+            f"{issue_path}/{claim_id}/release",
+            self.alice_token,
+            {"expected_version": 3},
+            key="http-claim-release-0001",
+        )
+        self.assertEqual(status, 200, released)
+        self.assertEqual(released["trusted_metadata"]["status"], "available")
+
+        session_id = self.create_session()
+        status, linked, _ = self.request(
+            "POST",
+            f"/v1/projects/project-one/sessions/{session_id}/items",
+            self.alice_token,
+            {
+                "to": "bob",
+                "title": "Review the issue",
+                "body": "Please review the linked work.",
+                "claim_id": claim_id,
+            },
+            key="http-linked-item-0001",
+        )
+        self.assertEqual(status, 201, linked)
+        self.assertEqual(
+            linked["trusted_metadata"]["work_claim"]["external_id"],
+            "owner/repository#321",
+        )
+
     def test_mutation_requires_idempotency_key(self) -> None:
         body = json.dumps({"label": "No key", "participants": ["alice"]}).encode()
         status, data, _ = self.request(

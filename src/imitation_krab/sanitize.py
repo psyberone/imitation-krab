@@ -6,8 +6,9 @@ from dataclasses import dataclass
 
 ASCII_HANDLE_RE = re.compile(r"^[a-z][a-z0-9_-]{2,31}$")
 PROJECT_KEY_RE = re.compile(r"^[a-z][a-z0-9-]{2,31}$")
-OBJECT_ID_RE = re.compile(r"^(?:usr|ses|itm)_[0-9a-f]{32}$")
+OBJECT_ID_RE = re.compile(r"^(?:usr|ses|itm|clm)_[0-9a-f]{32}$")
 IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
+EXTERNAL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/#-]{0,255}$")
 
 _SEMANTIC_FLAGS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
@@ -72,6 +73,15 @@ def validate_object_id(value: object, prefix: str | None = None) -> str:
 def validate_idempotency_key(value: object) -> str:
     if not isinstance(value, str) or not IDEMPOTENCY_KEY_RE.fullmatch(value):
         raise ValidationError("invalid Idempotency-Key")
+    return value
+
+
+def validate_external_id(value: object) -> str:
+    """Validate an opaque, display-safe external issue or pull-request identifier."""
+    if not isinstance(value, str) or not EXTERNAL_ID_RE.fullmatch(value):
+        raise ValidationError(
+            "external_id must be 1 to 256 restricted ASCII characters"
+        )
     return value
 
 

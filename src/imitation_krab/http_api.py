@@ -23,6 +23,7 @@ from .db import Database
 from .service import MutationResult, Service, ServiceError
 
 LOG = logging.getLogger("imitation_krab.http")
+CLAIM_QUEUE_KINDS = {"issues": "issue", "pull-requests": "pull_request"}
 
 
 class JsonRequestError(ValueError):
@@ -287,6 +288,15 @@ class KrabRequestHandler(BaseHTTPRequestHandler):
         if path == ["v1", "projects"]:
             self._require_query(query, set())
             return 200, self.server.service.list_projects(actor)
+        if (
+            len(path) == 4
+            and path[:2] == ["v1", "projects"]
+            and path[3] in CLAIM_QUEUE_KINDS
+        ):
+            self._require_query(query, set())
+            return 200, self.server.service.list_work_claims(
+                actor, path[2], CLAIM_QUEUE_KINDS[path[3]]
+            )
         if len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "sessions":
             self._require_query(query, set())
             return 200, self.server.service.list_sessions(actor, path[2])
@@ -335,6 +345,46 @@ class KrabRequestHandler(BaseHTTPRequestHandler):
         body: dict[str, Any],
         idempotency_key: str,
     ) -> MutationResult:
+        if (
+            len(path) == 4
+            and path[:2] == ["v1", "projects"]
+            and path[3] in CLAIM_QUEUE_KINDS
+        ):
+            return self.server.service.create_work_claim(
+                actor,
+                path[2],
+                CLAIM_QUEUE_KINDS[path[3]],
+                body,
+                idempotency_key,
+            )
+        if (
+            len(path) == 6
+            and path[:2] == ["v1", "projects"]
+            and path[3] in CLAIM_QUEUE_KINDS
+            and path[5] == "claim"
+        ):
+            return self.server.service.claim_work(
+                actor,
+                path[2],
+                CLAIM_QUEUE_KINDS[path[3]],
+                path[4],
+                body,
+                idempotency_key,
+            )
+        if (
+            len(path) == 6
+            and path[:2] == ["v1", "projects"]
+            and path[3] in CLAIM_QUEUE_KINDS
+            and path[5] == "release"
+        ):
+            return self.server.service.release_work(
+                actor,
+                path[2],
+                CLAIM_QUEUE_KINDS[path[3]],
+                path[4],
+                body,
+                idempotency_key,
+            )
         if len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "sessions":
             return self.server.service.create_session(
                 actor, path[2], body, idempotency_key
@@ -384,6 +434,20 @@ class KrabRequestHandler(BaseHTTPRequestHandler):
         body: dict[str, Any],
         idempotency_key: str,
     ) -> MutationResult:
+        if (
+            len(path) == 6
+            and path[:2] == ["v1", "projects"]
+            and path[3] in CLAIM_QUEUE_KINDS
+            and path[5] == "status"
+        ):
+            return self.server.service.change_work_status(
+                actor,
+                path[2],
+                CLAIM_QUEUE_KINDS[path[3]],
+                path[4],
+                body,
+                idempotency_key,
+            )
         if (
             len(path) == 8
             and path[:2] == ["v1", "projects"]

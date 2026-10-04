@@ -30,6 +30,12 @@ the raw bearer token in model context.
    HTTP API.
 10. No token, authorization header, request body, or work-item content enters
     the structured request log.
+11. Shared issue and pull-request claims are visible only to project members;
+    assignment always comes from the authenticated actor.
+12. Claim acquisition is atomic and versioned. Only the assignee can advance a
+    claim; only the assignee or a project admin can release non-terminal work.
+13. A message-to-claim link is immutable and cannot cross a project boundary.
+    Message and claim lifecycles do not grant authority to one another.
 
 ## Trust boundaries
 
@@ -39,12 +45,21 @@ The server owns user IDs, authenticated sender identity, project/session
 relationships, timestamps, event sequence numbers, status, versions, and
 routing. These values are never derived from message prose.
 
+Claim kind, assignment, state, version, and linkage are server-enforced control
+data. An external work identifier is restricted ASCII and immutable once
+registered, but remains a project-member-supplied local reference. Its presence
+does not prove that a GitHub object exists or authorize any GitHub operation.
+
 ### Untrusted content
 
 Project and session labels, titles, bodies, notes, and result summaries remain
 untrusted even when an authenticated user supplied them. API responses place
 them under `untrusted_text`; consumers must not merge them into a system or
 developer instruction channel.
+
+External work identifiers are not prose fields, but they are still supplied by
+project members and are not externally verified. Consumers must treat them as
+opaque labels, never as instructions, URLs to follow, or proof of authority.
 
 ### Execution
 
@@ -64,6 +79,10 @@ content.
 | Sender impersonation | Sender always comes from authentication; no accepted `sender_id` field |
 | Work-item bait-and-switch | Delivered title/body/scope/parties are immutable |
 | Lost concurrent update | Required expected version and transactional update |
+| Duplicate work ownership | Immediate write transaction, one assignee, fixed claim transitions, and optimistic version checks |
+| Stale or abandoned claim | Assignee release plus project-admin release; no reassignment endpoint |
+| Forged/cross-project work link | Opaque claim IDs, membership checks, foreign key, same-project trigger, and immutable-link trigger |
+| Malicious external identifier | Restricted ASCII and length, opaque-reference semantics, no URL parsing/fetching, and no external action |
 | Retry duplication or replay confusion | Required idempotency keys bound to actor, operation, and request hash |
 | Queue flooding | Request throttles, per-user long-poll concurrency, participant/session/event limits, message-size limits, per-route open-item cap, and database-size cap |
 | Terminal/log injection | Dangerous controls rejected on ingress; console escapes again on output; structured logs omit bodies |
@@ -140,6 +159,11 @@ checks limit other users' data, not that user's own blast radius.
 - A fully compromised daemon account or host can alter state and credentials.
 - A compromised authenticated agent can perform every operation granted to its
   identity until the token is revoked.
+- The claim registry does not authenticate to, query, or synchronize with
+  GitHub. Duplicate spellings or stale external state are an agent/operator
+  concern; uniqueness covers only the exact project, kind, and external ID.
+- Claim ownership is cooperative coordination, not a filesystem lock or a
+  substitute for GitHub permissions and branch protection.
 - There is no automatic retention or archive operation. The 256 MiB database
   ceiling prevents host-disk exhaustion, but a malicious or long-running user
   can still consume that allowance and deny future writes until an operator
@@ -157,4 +181,5 @@ checks limit other users' data, not that user's own blast radius.
 Security-relevant changes should preserve tests for authentication isolation,
 scope isolation, fixed status transitions, optimistic concurrency,
 idempotency, strict JSON parsing, hostile Unicode/control characters, prompt
-risk tagging, immutable content, queue privacy, and reminder throttling.
+risk tagging, immutable content and work links, queue privacy, atomic claim
+ownership, admin release boundaries, and reminder throttling.

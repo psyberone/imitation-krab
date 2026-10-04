@@ -1,0 +1,28 @@
+# panopticon.yml -- reviewed and committed like any other linter config.
+# groups: match/tests/panels/exclude, gitignore-flavored globs; first
+# matching group wins. A group whose keys are names (no match:) is a
+# parent; its subgroups are its layers and roll up to it in the report.
+# settings: max_per_group (8-48) / max_groups (4-64) / include_fixtures;
+# gate keys only tighten the review, operator flags are refused.
+version: 1
+groups:
+  Projects:
+    match:
+    - src/imitation_krab/service.py
+    - src/imitation_krab/db.py
+    - src/imitation_krab/cli.py
+    - src/imitation_krab/config.py
+    - src/imitation_krab/sanitize.py
+    - src/imitation_krab/__init__.py
+    - src/imitation_krab/__main__.py
+    tests:
+    - tests/test_sanitize.py
+    panels:
+    - ARC
+    - DAT
+    - SEC
+  API:
+    match:
+    - src/imitation_krab/http_api.py
+    panels:
+    - SEC

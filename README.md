@@ -8,7 +8,13 @@ Each user has one server-generated bearer token and a private delivery queue.
 Every work item belongs to exactly one project and one session. Users can place
 work into another session participant's queue, update work through a fixed
 status machine, and send a bodyless reminder. They cannot inspect another
-user's queue or open a peer-to-peer connection.
+user’s queue or open a peer-to-peer connection.
+
+Each project also has two shared claim queues: issues and pull requests. They
+are filtered views over one small local registry, not GitHub integration.
+Project members can register an opaque external identifier and atomically claim
+it for themselves. A work item may carry one immutable link to a registry
+entry.
 
 The v0 daemon binds to `127.0.0.1` by default, uses SQLite, and has no runtime
 package dependencies beyond Python 3.11 or newer. Its explicit container mode
@@ -90,6 +96,17 @@ Start the service and inspect its health:
 docker compose up --detach krab
 docker compose ps
 curl --fail --silent http://127.0.0.1:8765/v1/health
+```
+
+New images migrate an existing v1 database to v2 at startup without deleting
+users, projects, sessions, or messages. Take a verified backup before updating,
+then rebuild and recreate the service container:
+
+```console
+docker compose --profile admin run --rm krab-admin \
+  admin backup "/var/lib/imitation-krab/backups/krab-before-v2.db"
+docker compose build --pull
+docker compose up --detach --force-recreate krab
 ```
 
 Install just the host CLI as described above, or invoke it with
@@ -194,6 +211,55 @@ krab --token-file ~/.config/imitation-krab/bob.token \
 Console output escapes terminal controls and labels every user-controlled field
 as content. Add the global `--json` option for machine-readable output.
 
+## Claim issues and pull requests
+
+The claim registry is deliberately local and cooperative. `external_id` is an
+opaque, unverified identifier containing at most 256 restricted ASCII
+characters. A useful convention is `owner/repository#123`, but the server does
+not parse it, normalize case, contact GitHub, or verify that the object exists.
+Agents are responsible for choosing one canonical identifier.
+
+Register and inspect shared project work:
+
+```console
+krab --token-file ~/.config/imitation-krab/alice.token \
+  claim-add 'psyberone/imitation-krab#42' \
+  --project imitation-krab --kind issue
+
+krab --token-file ~/.config/imitation-krab/bob.token \
+  issues --project imitation-krab
+
+krab --token-file ~/.config/imitation-krab/bob.token \
+  prs --project imitation-krab
+```
+
+The create response contains a `clm_...` identifier and version `1`. Claiming
+always assigns the authenticated caller; there is no arbitrary assignee field:
+
+```console
+krab --token-file ~/.config/imitation-krab/bob.token \
+  claim clm_0123456789abcdef0123456789abcdef \
+  --project imitation-krab --kind issue --expected-version 1
+
+krab --token-file ~/.config/imitation-krab/bob.token \
+  claim-status clm_0123456789abcdef0123456789abcdef active \
+  --project imitation-krab --kind issue --expected-version 2
+
+krab --token-file ~/.config/imitation-krab/bob.token \
+  claim-status clm_0123456789abcdef0123456789abcdef done \
+  --project imitation-krab --kind issue --expected-version 3
+```
+
+The fixed lifecycle is `available → claimed → active → done`.
+The assignee can release `claimed` or `active` work back to `available`; a
+project admin can do the same to recover stale claims. `done` is terminal.
+Every mutation requires the version last observed, and competing claim attempts
+produce one winner.
+
+Link a message at creation time with `send --claim clm_...`. The link, project,
+kind, and external identifier are immutable. Claim state and message status are
+independent: neither lifecycle silently changes the other.
+
 ## Status machine
 
 Statuses are fixed in code; they are not configurable workflows.
@@ -251,6 +317,18 @@ use for a safe retry. Reusing a key with different content is rejected.
 
 ```text
 GET   /v1/projects
+GET   /v1/projects/{project}/issues
+POST  /v1/projects/{project}/issues
+POST  /v1/projects/{project}/issues/{claim}/claim
+POST  /v1/projects/{project}/issues/{claim}/release
+PATCH /v1/projects/{project}/issues/{claim}/status
+
+GET   /v1/projects/{project}/pull-requests
+POST  /v1/projects/{project}/pull-requests
+POST  /v1/projects/{project}/pull-requests/{claim}/claim
+POST  /v1/projects/{project}/pull-requests/{claim}/release
+PATCH /v1/projects/{project}/pull-requests/{claim}/status
+
 GET   /v1/projects/{project}/sessions
 POST  /v1/projects/{project}/sessions
 POST  /v1/projects/{project}/sessions/{session}/close
@@ -288,6 +366,11 @@ Responses keep provenance separate from content:
 Client software must preserve that trust distinction. Encoding text as JSON
 does not make its instructions trustworthy.
 
+An `external_id` appears in authenticated metadata because the server has
+validated its restricted representation and immutable registry relationship.
+It is still only a member-supplied local reference, not proof about GitHub or
+permission to perform any external action.
+
 ## Limits
 
 - Request body: 32 KiB
@@ -299,6 +382,8 @@ does not make its instructions trustworthy.
 - Open items from one sender to one recipient in one session: 100
 - Active sessions created by one user in one project: 50
 - Events per work item: 128, with a terminal transition still permitted
+- External work identifier: 256 restricted ASCII characters
+- Work claims per project: 10,000
 - SQLite database: 256 MiB maximum
 - Reminder cooldown: 60 seconds per sender and item
 - Session participants: 32

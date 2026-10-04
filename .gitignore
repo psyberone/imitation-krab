@@ -10,3 +10,6 @@ build/
 dist/
 .venv/
 .krab/
+# panopticon run artifacts (--setup #485)
+.claude/settings.local.json
+panopticon.yml.draft

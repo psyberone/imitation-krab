@@ -18,7 +18,7 @@ from .config import MAX_DATABASE_BYTES, default_db_path, default_pepper_path
 from .sanitize import sanitize_text, validate_handle, validate_project_key
 
 TOKEN_RE = re.compile(r"^krab_(usr_[0-9a-f]{32})_([A-Za-z0-9_-]{43})$")
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 SCHEMA = """
@@ -53,6 +53,32 @@ CREATE TABLE IF NOT EXISTS project_members (
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE RESTRICT
 );
 
+CREATE TABLE IF NOT EXISTS work_claims (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('issue', 'pull_request')),
+    external_id TEXT NOT NULL CHECK (length(external_id) BETWEEN 1 AND 256),
+    assignee_id TEXT,
+    status TEXT NOT NULL DEFAULT 'available' CHECK (status IN (
+        'available', 'claimed', 'active', 'done'
+    )),
+    version INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (project_id, kind, external_id),
+    UNIQUE (project_id, id),
+    CHECK (
+        (status = 'available' AND assignee_id IS NULL)
+        OR (status IN ('claimed', 'active', 'done') AND assignee_id IS NOT NULL)
+    ),
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE RESTRICT,
+    FOREIGN KEY (project_id, assignee_id)
+        REFERENCES project_members(project_id, user_id) ON DELETE RESTRICT,
+    FOREIGN KEY (project_id, created_by)
+        REFERENCES project_members(project_id, user_id) ON DELETE RESTRICT
+);
+
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL,
@@ -84,6 +110,7 @@ CREATE TABLE IF NOT EXISTS items (
     session_id TEXT NOT NULL,
     creator_id TEXT NOT NULL,
     recipient_id TEXT NOT NULL,
+    work_claim_id TEXT,
     title TEXT NOT NULL,
     body TEXT NOT NULL,
     risk_flags TEXT NOT NULL DEFAULT '[]',
@@ -104,7 +131,8 @@ CREATE TABLE IF NOT EXISTS items (
     FOREIGN KEY (project_id, session_id, creator_id)
         REFERENCES session_members(project_id, session_id, user_id) ON DELETE RESTRICT,
     FOREIGN KEY (project_id, session_id, recipient_id)
-        REFERENCES session_members(project_id, session_id, user_id) ON DELETE RESTRICT
+        REFERENCES session_members(project_id, session_id, user_id) ON DELETE RESTRICT,
+    FOREIGN KEY (work_claim_id) REFERENCES work_claims(id) ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -163,11 +191,125 @@ CREATE INDEX IF NOT EXISTS idx_items_recipient_status
     ON items(recipient_id, project_id, session_id, status);
 CREATE INDEX IF NOT EXISTS idx_items_creator
     ON items(creator_id, project_id, session_id);
+CREATE INDEX IF NOT EXISTS idx_work_claims_queue
+    ON work_claims(project_id, kind, status, updated_at, id);
+CREATE INDEX IF NOT EXISTS idx_work_claims_assignee
+    ON work_claims(assignee_id, project_id, status);
 CREATE INDEX IF NOT EXISTS idx_events_item
     ON events(item_id, seq);
 CREATE INDEX IF NOT EXISTS idx_deliveries_user_event
     ON deliveries(user_id, event_seq);
+
+CREATE TRIGGER IF NOT EXISTS items_work_claim_scope_insert
+BEFORE INSERT ON items
+FOR EACH ROW
+WHEN NEW.work_claim_id IS NOT NULL
+ AND NOT EXISTS (
+    SELECT 1 FROM work_claims
+    WHERE id = NEW.work_claim_id AND project_id = NEW.project_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'work claim scope mismatch');
+END;
+
+CREATE TRIGGER IF NOT EXISTS items_work_claim_scope_project_update
+BEFORE UPDATE OF project_id ON items
+FOR EACH ROW
+WHEN NEW.work_claim_id IS NOT NULL
+ AND NOT EXISTS (
+    SELECT 1 FROM work_claims
+    WHERE id = NEW.work_claim_id AND project_id = NEW.project_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'work claim scope mismatch');
+END;
+
+CREATE TRIGGER IF NOT EXISTS items_work_claim_immutable
+BEFORE UPDATE OF work_claim_id ON items
+FOR EACH ROW
+WHEN NEW.work_claim_id IS NOT OLD.work_claim_id
+BEGIN
+    SELECT RAISE(ABORT, 'work claim link is immutable');
+END;
 """
+
+
+MIGRATION_1_TO_2 = (
+    """
+    CREATE TABLE work_claims (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('issue', 'pull_request')),
+        external_id TEXT NOT NULL CHECK (length(external_id) BETWEEN 1 AND 256),
+        assignee_id TEXT,
+        status TEXT NOT NULL DEFAULT 'available' CHECK (status IN (
+            'available', 'claimed', 'active', 'done'
+        )),
+        version INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
+        created_by TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (project_id, kind, external_id),
+        UNIQUE (project_id, id),
+        CHECK (
+            (status = 'available' AND assignee_id IS NULL)
+            OR (status IN ('claimed', 'active', 'done') AND assignee_id IS NOT NULL)
+        ),
+        FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE RESTRICT,
+        FOREIGN KEY (project_id, assignee_id)
+            REFERENCES project_members(project_id, user_id) ON DELETE RESTRICT,
+        FOREIGN KEY (project_id, created_by)
+            REFERENCES project_members(project_id, user_id) ON DELETE RESTRICT
+    )
+    """,
+    """
+    ALTER TABLE items ADD COLUMN work_claim_id TEXT
+        REFERENCES work_claims(id) ON DELETE RESTRICT
+    """,
+    """
+    CREATE INDEX idx_work_claims_queue
+        ON work_claims(project_id, kind, status, updated_at, id)
+    """,
+    """
+    CREATE INDEX idx_work_claims_assignee
+        ON work_claims(assignee_id, project_id, status)
+    """,
+    """
+    CREATE TRIGGER items_work_claim_scope_insert
+    BEFORE INSERT ON items
+    FOR EACH ROW
+    WHEN NEW.work_claim_id IS NOT NULL
+     AND NOT EXISTS (
+        SELECT 1 FROM work_claims
+        WHERE id = NEW.work_claim_id AND project_id = NEW.project_id
+     )
+    BEGIN
+        SELECT RAISE(ABORT, 'work claim scope mismatch');
+    END
+    """,
+    """
+    CREATE TRIGGER items_work_claim_scope_project_update
+    BEFORE UPDATE OF project_id ON items
+    FOR EACH ROW
+    WHEN NEW.work_claim_id IS NOT NULL
+     AND NOT EXISTS (
+        SELECT 1 FROM work_claims
+        WHERE id = NEW.work_claim_id AND project_id = NEW.project_id
+     )
+    BEGIN
+        SELECT RAISE(ABORT, 'work claim scope mismatch');
+    END
+    """,
+    """
+    CREATE TRIGGER items_work_claim_immutable
+    BEFORE UPDATE OF work_claim_id ON items
+    FOR EACH ROW
+    WHEN NEW.work_claim_id IS NOT OLD.work_claim_id
+    BEGIN
+        SELECT RAISE(ABORT, 'work claim link is immutable');
+    END
+    """,
+)
 
 
 class DatabaseError(RuntimeError):
@@ -201,15 +343,23 @@ class Database:
         self._reject_symlink(self.path, allow_missing=True)
         conn = self.connect(initialize=False)
         try:
-            conn.executescript(SCHEMA)
-            rows = conn.execute("SELECT version FROM schema_meta").fetchall()
-            if not rows:
+            tables = {
+                row["name"]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+                ).fetchall()
+            }
+            if "schema_meta" not in tables:
+                if tables:
+                    raise DatabaseError("database is not an imitation-krab database")
+                conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA)
                 conn.execute(
                     "INSERT INTO schema_meta(version) VALUES (?)", (SCHEMA_VERSION,)
                 )
-            elif len(rows) != 1 or rows[0]["version"] != SCHEMA_VERSION:
-                raise DatabaseError("unsupported database schema version")
-            conn.commit()
+                conn.commit()
+            else:
+                self._migrate_schema(conn)
         finally:
             conn.close()
         os.chmod(self.path, 0o600)
@@ -229,16 +379,57 @@ class Database:
             if info.st_nlink != 1:
                 raise DatabaseError("database file must not be hard-linked")
         conn = sqlite3.connect(self.path, timeout=5.0, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA busy_timeout = 5000")
-        conn.execute("PRAGMA trusted_schema = OFF")
-        conn.execute("PRAGMA secure_delete = ON")
-        conn.execute("PRAGMA journal_mode = WAL")
-        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
-        max_pages = max(1, MAX_DATABASE_BYTES // page_size)
-        conn.execute(f"PRAGMA max_page_count = {max_pages}")
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA busy_timeout = 5000")
+            conn.execute("PRAGMA trusted_schema = OFF")
+            conn.execute("PRAGMA secure_delete = ON")
+            conn.execute("PRAGMA journal_mode = WAL")
+            page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+            max_pages = max(1, MAX_DATABASE_BYTES // page_size)
+            conn.execute(f"PRAGMA max_page_count = {max_pages}")
+            if initialize:
+                self._migrate_schema(conn)
+            return conn
+        except Exception:
+            conn.close()
+            raise
+
+    def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        try:
+            rows = conn.execute("SELECT version FROM schema_meta").fetchall()
+        except sqlite3.OperationalError as exc:
+            raise DatabaseError("database schema metadata is missing") from exc
+        if len(rows) != 1 or not isinstance(rows[0]["version"], int):
+            raise DatabaseError("database schema metadata is invalid")
+        version = rows[0]["version"]
+        if version == SCHEMA_VERSION:
+            return
+        if version != 1:
+            raise DatabaseError("unsupported database schema version")
+
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            locked_rows = conn.execute("SELECT version FROM schema_meta").fetchall()
+            if len(locked_rows) != 1:
+                raise DatabaseError("database schema metadata is invalid")
+            locked_version = locked_rows[0]["version"]
+            if locked_version == SCHEMA_VERSION:
+                conn.commit()
+                return
+            if locked_version != 1:
+                raise DatabaseError("unsupported database schema version")
+            for statement in MIGRATION_1_TO_2:
+                conn.execute(statement)
+            conn.execute(
+                "UPDATE schema_meta SET version = ? WHERE version = 1",
+                (SCHEMA_VERSION,),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
     def backup(self, destination: Path | str) -> dict[str, Any]:
         """Create a consistent, private SQLite snapshot without overwriting."""

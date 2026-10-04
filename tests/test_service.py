@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import sqlite3
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -41,18 +44,270 @@ class ServiceFixture(unittest.TestCase):
         self.temporary.cleanup()
 
     def create_item(
-        self, *, key: str = "create-item-0001", body: str = "Please review it"
+        self,
+        *,
+        key: str = "create-item-0001",
+        body: str = "Please review it",
+        claim_id: str | None = None,
     ):
+        payload = {
+            "to": "bob",
+            "title": "Review authentication",
+            "body": body,
+        }
+        if claim_id is not None:
+            payload["claim_id"] = claim_id
         return self.service.create_item(
             self.alice,
             "project-one",
             self.session_id,
-            {"to": "bob", "title": "Review authentication", "body": body},
+            payload,
+            key,
+        )
+
+    def create_claim(
+        self,
+        *,
+        actor: dict | None = None,
+        project: str = "project-one",
+        kind: str = "issue",
+        external_id: str = "owner/repository#123",
+        key: str = "create-claim-0001",
+    ):
+        return self.service.create_work_claim(
+            actor or self.alice,
+            project,
+            kind,
+            {"external_id": external_id},
             key,
         )
 
 
 class ServiceTests(ServiceFixture):
+    def test_competing_claims_have_exactly_one_winner(self) -> None:
+        claim_id = self.create_claim(
+            external_id="owner/repository#race", key="create-race-claim-0001"
+        ).payload["trusted_metadata"]["claim_id"]
+        barrier = threading.Barrier(2)
+
+        def attempt(actor: dict, key: str) -> tuple[str, str]:
+            barrier.wait(timeout=2)
+            try:
+                result = self.service.claim_work(
+                    actor,
+                    "project-one",
+                    "issue",
+                    claim_id,
+                    {"expected_version": 1},
+                    key,
+                )
+                assignee = result.payload["trusted_metadata"]["assignee"]
+                return "won", assignee["handle"]
+            except ServiceError as exc:
+                return "lost", exc.code
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(
+                pool.map(
+                    lambda pair: attempt(*pair),
+                    (
+                        (self.alice, "race-claim-alice-0001"),
+                        (self.bob, "race-claim-bob-0001"),
+                    ),
+                )
+            )
+        self.assertEqual([result[0] for result in results].count("won"), 1)
+        self.assertEqual([result[0] for result in results].count("lost"), 1)
+        loser_code = next(value for outcome, value in results if outcome == "lost")
+        self.assertEqual(loser_code, "version_conflict")
+
+    def test_claim_registry_is_scoped_atomic_and_versioned(self) -> None:
+        created = self.create_claim().payload
+        claim_id = created["trusted_metadata"]["claim_id"]
+        self.assertEqual(created["trusted_metadata"]["status"], "available")
+        self.assertIsNone(created["trusted_metadata"]["assignee"])
+
+        visible = self.service.list_work_claims(
+            self.bob, "project-one", "issue"
+        )
+        self.assertEqual(
+            visible["claims"][0]["trusted_metadata"]["external_id"],
+            "owner/repository#123",
+        )
+        with self.assertRaises(ServiceError) as caught:
+            self.service.list_work_claims(self.mallory, "project-one", "issue")
+        self.assertEqual(caught.exception.status, 404)
+
+        claimed = self.service.claim_work(
+            self.bob,
+            "project-one",
+            "issue",
+            claim_id,
+            {"expected_version": 1},
+            "take-claim-0001",
+        )
+        self.assertEqual(claimed.payload["trusted_metadata"]["status"], "claimed")
+        self.assertEqual(
+            claimed.payload["trusted_metadata"]["assignee"]["handle"], "bob"
+        )
+        self.assertEqual(claimed.payload["trusted_metadata"]["version"], 2)
+
+        with self.assertRaises(ServiceError) as caught:
+            self.service.claim_work(
+                self.alice,
+                "project-one",
+                "issue",
+                claim_id,
+                {"expected_version": 1},
+                "take-claim-0002",
+            )
+        self.assertEqual(caught.exception.status, 409)
+
+        with self.assertRaises(ServiceError) as caught:
+            self.service.change_work_status(
+                self.alice,
+                "project-one",
+                "issue",
+                claim_id,
+                {"status": "active", "expected_version": 2},
+                "start-claim-0001",
+            )
+        self.assertEqual(caught.exception.status, 403)
+
+        active = self.service.change_work_status(
+            self.bob,
+            "project-one",
+            "issue",
+            claim_id,
+            {"status": "active", "expected_version": 2},
+            "start-claim-0002",
+        )
+        self.assertEqual(active.payload["trusted_metadata"]["version"], 3)
+        done = self.service.change_work_status(
+            self.bob,
+            "project-one",
+            "issue",
+            claim_id,
+            {"status": "done", "expected_version": 3},
+            "finish-claim-0001",
+        )
+        self.assertEqual(done.payload["trusted_metadata"]["status"], "done")
+
+        with self.assertRaises(ServiceError) as caught:
+            self.service.release_work(
+                self.bob,
+                "project-one",
+                "issue",
+                claim_id,
+                {"expected_version": 4},
+                "release-claim-0001",
+            )
+        self.assertEqual(caught.exception.code, "invalid_transition")
+
+    def test_claim_release_is_limited_to_assignee_or_project_admin(self) -> None:
+        _, carol_token = self.db.create_user("carol")
+        self.db.add_project_member("project-one", "carol", "member")
+        carol = self.db.authenticate(carol_token)
+        assert carol
+        claim_id = self.create_claim(
+            external_id="owner/repository#124",
+            key="create-claim-0002",
+        ).payload["trusted_metadata"]["claim_id"]
+        self.service.claim_work(
+            self.bob,
+            "project-one",
+            "issue",
+            claim_id,
+            {"expected_version": 1},
+            "take-claim-0003",
+        )
+
+        with self.assertRaises(ServiceError) as caught:
+            self.service.release_work(
+                carol,
+                "project-one",
+                "issue",
+                claim_id,
+                {"expected_version": 2},
+                "release-claim-0002",
+            )
+        self.assertEqual(caught.exception.status, 403)
+
+        released = self.service.release_work(
+            self.alice,
+            "project-one",
+            "issue",
+            claim_id,
+            {"expected_version": 2},
+            "release-claim-0003",
+        )
+        self.assertEqual(released.payload["trusted_metadata"]["status"], "available")
+        self.assertIsNone(released.payload["trusted_metadata"]["assignee"])
+        self.assertEqual(released.payload["trusted_metadata"]["version"], 3)
+
+    def test_claim_references_are_unique_per_kind_and_idempotent(self) -> None:
+        first = self.create_claim(key="same-claim-0001")
+        replay = self.create_claim(key="same-claim-0001")
+        self.assertTrue(replay.replayed)
+        self.assertEqual(first.payload, replay.payload)
+
+        with self.assertRaises(ServiceError) as caught:
+            self.create_claim(key="duplicate-claim-0001")
+        self.assertEqual(caught.exception.code, "reference_exists")
+
+        pull_request = self.create_claim(
+            kind="pull_request", key="same-reference-pr-0001"
+        )
+        self.assertEqual(
+            pull_request.payload["trusted_metadata"]["kind"], "pull_request"
+        )
+
+    def test_item_claim_link_is_same_project_and_immutable(self) -> None:
+        claim_id = self.create_claim(
+            external_id="owner/repository#125", key="create-claim-link-0001"
+        ).payload["trusted_metadata"]["claim_id"]
+        linked = self.create_item(
+            claim_id=claim_id, key="create-linked-item-0001"
+        ).payload
+        self.assertEqual(
+            linked["trusted_metadata"]["work_claim"],
+            {
+                "claim_id": claim_id,
+                "kind": "issue",
+                "external_id": "owner/repository#125",
+            },
+        )
+
+        queued = self.service.get_queue(
+            self.bob, "project-one", self.session_id, after=0, limit=10
+        )
+        self.assertEqual(
+            queued["events"][0]["trusted_metadata"]["work_claim"]["claim_id"],
+            claim_id,
+        )
+
+        foreign_claim = self.create_claim(
+            actor=self.mallory,
+            project="project-two",
+            external_id="other/repository#1",
+            key="foreign-claim-0001",
+        ).payload["trusted_metadata"]["claim_id"]
+        with self.assertRaises(ServiceError) as caught:
+            self.create_item(
+                claim_id=foreign_claim, key="cross-project-link-0001"
+            )
+        self.assertEqual(caught.exception.status, 404)
+
+        item_id = linked["trusted_metadata"]["item_id"]
+        conn = self.db.connect()
+        try:
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    "UPDATE items SET work_claim_id = NULL WHERE id = ?", (item_id,)
+                )
+        finally:
+            conn.close()
+
     def test_online_backup_is_private_consistent_and_never_overwrites(self) -> None:
         backup_path = Path(self.temporary.name) / "backups" / "krab.db"
         result = self.db.backup(backup_path)
@@ -64,7 +319,7 @@ class ServiceTests(ServiceFixture):
         self.assertFalse(backup_path.with_name("krab.db-shm").exists())
 
         self.db.create_user("charlie")
-        with sqlite3.connect(backup_path) as backup:
+        with closing(sqlite3.connect(backup_path)) as backup:
             self.assertEqual(
                 backup.execute("SELECT COUNT(*) FROM users").fetchone()[0], 3
             )
@@ -314,6 +569,58 @@ class ServiceTests(ServiceFixture):
             self.assertEqual(
                 rejected.payload["trusted_metadata"]["status"], "closed.rejected"
             )
+
+class DatabaseMigrationTests(unittest.TestCase):
+    def test_v1_database_migrates_in_place_without_losing_items(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database_path = root / "legacy.db"
+            with closing(sqlite3.connect(database_path)) as conn:
+                conn.executescript(
+                    """
+                    CREATE TABLE schema_meta (version INTEGER NOT NULL);
+                    INSERT INTO schema_meta(version) VALUES (1);
+                    CREATE TABLE users (id TEXT PRIMARY KEY);
+                    CREATE TABLE projects (id TEXT PRIMARY KEY);
+                    CREATE TABLE project_members (
+                        project_id TEXT NOT NULL,
+                        user_id TEXT NOT NULL,
+                        PRIMARY KEY (project_id, user_id)
+                    );
+                    CREATE TABLE items (
+                        id TEXT PRIMARY KEY,
+                        project_id TEXT NOT NULL
+                    );
+                    INSERT INTO projects(id) VALUES ('prj_legacy');
+                    INSERT INTO items(id, project_id)
+                    VALUES ('itm_legacy', 'prj_legacy');
+                    """
+                )
+                conn.commit()
+            database_path.chmod(0o600)
+
+            database = Database(database_path, root / "pepper.key")
+            database.initialize()
+            conn = database.connect()
+            try:
+                self.assertEqual(
+                    conn.execute("SELECT version FROM schema_meta").fetchone()[0], 2
+                )
+                columns = {
+                    row[1] for row in conn.execute("PRAGMA table_info(items)").fetchall()
+                }
+                self.assertIn("work_claim_id", columns)
+                self.assertIsNotNone(
+                    conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table' "
+                        "AND name = 'work_claims'"
+                    ).fetchone()
+                )
+                self.assertEqual(
+                    conn.execute("SELECT id FROM items").fetchone()[0], "itm_legacy"
+                )
+            finally:
+                conn.close()
 
 
 if __name__ == "__main__":
