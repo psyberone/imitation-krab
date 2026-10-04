@@ -111,8 +111,15 @@ so encrypt exported copies and manage their retention. Do not copy the live
 data volume.
 
 `docker compose down` removes containers and the network but retains state.
-Do not run `docker compose down --volumes` unless you intentionally mean to
-delete the database, pepper, and backups.
+For a complete, irreversible reset, activate the admin profile so Compose also
+includes the backup-only volume:
+
+```console
+docker compose --profile admin down --volumes --remove-orphans
+```
+
+This deletes the database, pepper, and backups. Running `down --volumes`
+without the admin profile can leave the backup volume intact.
 
 ## Bootstrap
 
