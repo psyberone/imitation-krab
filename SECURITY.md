@@ -31,10 +31,17 @@ the raw bearer token in model context.
 10. No token, authorization header, request body, or work-item content enters
     the structured request log.
 11. Shared issue and pull-request claims are visible only to project members;
-    assignment always comes from the authenticated actor.
-12. Claim acquisition is atomic and versioned. Only the assignee can advance a
-    claim; only the assignee or a project admin can release non-terminal work.
-13. A message-to-claim link is immutable and cannot cross a project boundary.
+    only a project coordinator or admin can create or import their identifiers.
+12. Claim acquisition and assignment are atomic and versioned. Members can
+    claim only for themselves. A coordinator or admin can assign only available
+    work to an active member of the same project and cannot silently reassign it.
+13. Only the assignee can activate or submit their claim. Only a different
+    coordinator or admin can return submitted work or approve it as done; role
+    membership never permits self-approval. The assignee can release claimed or
+    active work, while a coordinator/admin can also release submitted work.
+    Imported identifiers are additive: omission never mutates or removes an
+    existing claim.
+14. A message-to-claim link is immutable and cannot cross a project boundary.
     Message and claim lifecycles do not grant authority to one another.
 
 ## Trust boundaries
@@ -45,10 +52,16 @@ The server owns user IDs, authenticated sender identity, project/session
 relationships, timestamps, event sequence numbers, status, versions, and
 routing. These values are never derived from message prose.
 
-Claim kind, assignment, state, version, and linkage are server-enforced control
-data. An external work identifier is restricted ASCII and immutable once
-registered, but remains a project-member-supplied local reference. Its presence
-does not prove that a GitHub object exists or authorize any GitHub operation.
+Claim kind, assignment, effective state, review marker, version, and linkage
+are server-enforced control data. An external work identifier is restricted
+ASCII and immutable once registered, but remains a coordinator/admin-supplied
+local reference. Its presence does not prove that a GitHub object exists or
+authorize any GitHub operation.
+
+Project roles are fixed rather than user-defined. Members perform work,
+coordinators may populate and manage the project claim queue, and admins retain
+the coordinator capabilities plus administrative override. Identity,
+membership, and role changes remain unavailable over HTTP.
 
 ### Untrusted content
 
@@ -58,8 +71,9 @@ them under `untrusted_text`; consumers must not merge them into a system or
 developer instruction channel.
 
 External work identifiers are not prose fields, but they are still supplied by
-project members and are not externally verified. Consumers must treat them as
-opaque labels, never as instructions, URLs to follow, or proof of authority.
+project coordinators/admins and are not externally verified. Consumers must
+treat them as opaque labels, never as instructions, URLs to follow, or proof of
+authority.
 
 ### Execution
 
@@ -80,7 +94,11 @@ content.
 | Work-item bait-and-switch | Delivered title/body/scope/parties are immutable |
 | Lost concurrent update | Required expected version and transactional update |
 | Duplicate work ownership | Immediate write transaction, one assignee, fixed claim transitions, and optimistic version checks |
-| Stale or abandoned claim | Assignee release plus project-admin release; no reassignment endpoint |
+| Queue poisoning by a member | Claim creation and import require coordinator or admin role |
+| Malicious or incomplete import | Restricted identifier-only schema, 100-entry cap, duplicate rejection, atomic additive transaction, and no deletion or mutation by omission |
+| Unauthorized assignment | Coordinator/admin check, active same-project assignee lookup, available-only transition, expected version, and audit entry |
+| Self-approval or forged review | Assignee identity check, independent coordinator/admin requirement, fixed transitions, expected version, and distinct audited verdicts |
+| Stale or abandoned claim | Assignee release for claimed/active work; coordinator/admin release including atomic review-marker cleanup; reassignment remains an explicit release followed by assignment |
 | Forged/cross-project work link | Opaque claim IDs, membership checks, foreign key, same-project trigger, and immutable-link trigger |
 | Malicious external identifier | Restricted ASCII and length, opaque-reference semantics, no URL parsing/fetching, and no external action |
 | Retry duplication or replay confusion | Required idempotency keys bound to actor, operation, and request hash |
@@ -160,10 +178,14 @@ checks limit other users' data, not that user's own blast radius.
 - A compromised authenticated agent can perform every operation granted to its
   identity until the token is revoked.
 - The claim registry does not authenticate to, query, or synchronize with
-  GitHub. Duplicate spellings or stale external state are an agent/operator
-  concern; uniqueness covers only the exact project, kind, and external ID.
+  GitHub. Import accepts only a caller-supplied identifier manifest and is not
+  synchronization: duplicate spellings or stale external state are an
+  agent/operator concern, and uniqueness covers only the exact project, kind,
+  and external ID.
 - Claim ownership is cooperative coordination, not a filesystem lock or a
   substitute for GitHub permissions and branch protection.
+- Review readiness is a local handoff marker, not proof of a GitHub review,
+  branch status, test result, or merge authorization.
 - There is no automatic retention or archive operation. The 256 MiB database
   ceiling prevents host-disk exhaustion, but a malicious or long-running user
   can still consume that allowance and deny future writes until an operator
@@ -182,4 +204,6 @@ Security-relevant changes should preserve tests for authentication isolation,
 scope isolation, fixed status transitions, optimistic concurrency,
 idempotency, strict JSON parsing, hostile Unicode/control characters, prompt
 risk tagging, immutable content and work links, queue privacy, atomic claim
-ownership, admin release boundaries, and reminder throttling.
+ownership, coordinator/admin creation and assignment boundaries, additive
+import behavior, independent review and self-approval denial, exact scoped
+claim filters, release boundaries, and reminder throttling.

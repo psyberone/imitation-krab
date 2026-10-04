@@ -293,9 +293,13 @@ class KrabRequestHandler(BaseHTTPRequestHandler):
             and path[:2] == ["v1", "projects"]
             and path[3] in CLAIM_QUEUE_KINDS
         ):
-            self._require_query(query, set())
+            self._require_query(query, {"status", "assignee"})
             return 200, self.server.service.list_work_claims(
-                actor, path[2], CLAIM_QUEUE_KINDS[path[3]]
+                actor,
+                path[2],
+                CLAIM_QUEUE_KINDS[path[3]],
+                status=query.get("status", [None])[0],
+                assignee=query.get("assignee", [None])[0],
             )
         if len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "sessions":
             self._require_query(query, set())
@@ -346,6 +350,19 @@ class KrabRequestHandler(BaseHTTPRequestHandler):
         idempotency_key: str,
     ) -> MutationResult:
         if (
+            len(path) == 5
+            and path[:2] == ["v1", "projects"]
+            and path[3] in CLAIM_QUEUE_KINDS
+            and path[4] == "import"
+        ):
+            return self.server.service.import_work_claims(
+                actor,
+                path[2],
+                CLAIM_QUEUE_KINDS[path[3]],
+                body,
+                idempotency_key,
+            )
+        if (
             len(path) == 4
             and path[:2] == ["v1", "projects"]
             and path[3] in CLAIM_QUEUE_KINDS
@@ -354,6 +371,20 @@ class KrabRequestHandler(BaseHTTPRequestHandler):
                 actor,
                 path[2],
                 CLAIM_QUEUE_KINDS[path[3]],
+                body,
+                idempotency_key,
+            )
+        if (
+            len(path) == 6
+            and path[:2] == ["v1", "projects"]
+            and path[3] in CLAIM_QUEUE_KINDS
+            and path[5] == "assign"
+        ):
+            return self.server.service.assign_work(
+                actor,
+                path[2],
+                CLAIM_QUEUE_KINDS[path[3]],
+                path[4],
                 body,
                 idempotency_key,
             )

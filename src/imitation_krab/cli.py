@@ -19,6 +19,8 @@ from .config import (
     CONTAINER_HOST,
     DEFAULT_HOST,
     DEFAULT_PORT,
+    MAX_CLAIM_IMPORT_ENTRIES,
+    MAX_REQUEST_BYTES,
     default_db_path,
     default_pepper_path,
     default_server_url,
@@ -26,7 +28,7 @@ from .config import (
 )
 from .db import TOKEN_RE, Database, DatabaseError
 from .http_api import serve
-from .sanitize import terminal_lines
+from .sanitize import ValidationError, terminal_lines, validate_external_id
 
 STATUS_ALIASES = {
     "pending": "open.pending",
@@ -39,6 +41,13 @@ STATUS_ALIASES = {
 }
 
 CLAIM_KIND_PATHS = {"issue": "issues", "pr": "pull-requests"}
+CLAIM_STATUS_ALIASES = {
+    "available": "available",
+    "claimed": "claimed",
+    "active": "active",
+    "under-review": "under_review",
+    "done": "done",
+}
 
 
 class ClientError(RuntimeError):
@@ -181,7 +190,9 @@ def build_parser() -> argparse.ArgumentParser:
     project_member = admin_sub.add_parser("project-add-user")
     project_member.add_argument("project")
     project_member.add_argument("handle")
-    project_member.add_argument("--role", choices=["member", "admin"], default="member")
+    project_member.add_argument(
+        "--role", choices=["member", "coordinator", "admin"], default="member"
+    )
     backup = admin_sub.add_parser(
         "backup", help="create a live-safe SQLite snapshot without overwriting"
     )
@@ -190,12 +201,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("projects", help="list authenticated user's projects")
 
     issues = sub.add_parser("issues", help="list the project's issue claim queue")
-    issues.add_argument("--project", required=True)
+    _add_claim_list_args(issues)
 
     pull_requests = sub.add_parser(
         "prs", help="list the project's pull-request claim queue"
     )
-    pull_requests.add_argument("--project", required=True)
+    _add_claim_list_args(pull_requests)
 
     claim_add = sub.add_parser(
         "claim-add", help="register an issue or pull request as available work"
@@ -203,23 +214,42 @@ def build_parser() -> argparse.ArgumentParser:
     claim_add.add_argument("external_id")
     _add_claim_scope_args(claim_add)
 
+    claim_import = sub.add_parser(
+        "claim-import",
+        help="add missing issue or pull-request identifiers from a JSON array",
+    )
+    claim_import.add_argument("manifest", help="JSON file, or - for standard input")
+    _add_claim_scope_args(claim_import)
+    claim_import.add_argument(
+        "--dry-run", action="store_true", help="show additions without changing state"
+    )
+
     claim = sub.add_parser("claim", help="atomically claim work for yourself")
     claim.add_argument("claim_id")
     _add_claim_scope_args(claim)
     claim.add_argument("--expected-version", type=int, required=True)
 
+    claim_assign = sub.add_parser(
+        "claim-assign", help="assign available work as a coordinator or admin"
+    )
+    claim_assign.add_argument("claim_id")
+    _add_claim_scope_args(claim_assign)
+    claim_assign.add_argument("--to", required=True)
+    claim_assign.add_argument("--expected-version", type=int, required=True)
+
     claim_release = sub.add_parser(
-        "claim-release", help="release your claim, or release one as project admin"
+        "claim-release",
+        help="release your claim, or release one as coordinator or admin",
     )
     claim_release.add_argument("claim_id")
     _add_claim_scope_args(claim_release)
     claim_release.add_argument("--expected-version", type=int, required=True)
 
     claim_status = sub.add_parser(
-        "claim-status", help="advance your claimed work to active or done"
+        "claim-status", help="activate, submit, or review claimed work"
     )
     claim_status.add_argument("claim_id")
-    claim_status.add_argument("status", choices=["active", "done"])
+    claim_status.add_argument("status", choices=["active", "under-review", "done"])
     _add_claim_scope_args(claim_status)
     claim_status.add_argument("--expected-version", type=int, required=True)
 
@@ -281,6 +311,12 @@ def _add_scope_args(parser: argparse.ArgumentParser) -> None:
 def _add_claim_scope_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--project", required=True)
     parser.add_argument("--kind", choices=sorted(CLAIM_KIND_PATHS), required=True)
+
+
+def _add_claim_list_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--project", required=True)
+    parser.add_argument("--status", choices=sorted(CLAIM_STATUS_ALIASES))
+    parser.add_argument("--assignee")
 
 
 def _add_text_source(
@@ -361,8 +397,15 @@ def _run_client(args: argparse.Namespace, client: APIClient) -> int:
         _emit(args, result, kind="projects")
     elif command in {"issues", "prs"}:
         queue = "issues" if command == "issues" else "pull-requests"
+        query = {}
+        if args.status is not None:
+            query["status"] = CLAIM_STATUS_ALIASES[args.status]
+        if args.assignee is not None:
+            query["assignee"] = args.assignee
         result = client.request(
-            "GET", f"/v1/projects/{_segment(args.project)}/{queue}"
+            "GET",
+            f"/v1/projects/{_segment(args.project)}/{queue}",
+            query=query or None,
         )
         _emit(args, result, kind="claims")
     elif command == "claim-add":
@@ -372,11 +415,48 @@ def _run_client(args: argparse.Namespace, client: APIClient) -> int:
             payload={"external_id": args.external_id},
         )
         _emit(args, result, kind="claim")
+    elif command == "claim-import":
+        external_ids = _read_claim_manifest(args.manifest)
+        if args.dry_run:
+            current = client.request("GET", _claim_queue_path(args))
+            existing = {
+                claim["trusted_metadata"]["external_id"]
+                for claim in current.get("claims", [])
+            }
+            missing = [value for value in external_ids if value not in existing]
+            result = {
+                "trusted_metadata": {
+                    "project_key": args.project,
+                    "kind": "pull_request" if args.kind == "pr" else "issue",
+                    "requested_count": len(external_ids),
+                    "would_create_count": len(missing),
+                    "unchanged_count": len(external_ids) - len(missing),
+                    "dry_run": True,
+                },
+                "would_create": missing,
+            }
+        else:
+            result = client.request(
+                "POST",
+                _claim_queue_path(args) + "/import",
+                payload={"external_ids": external_ids},
+            )
+        _emit(args, result, kind="claim-import")
     elif command == "claim":
         result = client.request(
             "POST",
             _claim_path(args) + "/claim",
             payload={"expected_version": args.expected_version},
+        )
+        _emit(args, result, kind="claim")
+    elif command == "claim-assign":
+        result = client.request(
+            "POST",
+            _claim_path(args) + "/assign",
+            payload={
+                "assignee": args.to,
+                "expected_version": args.expected_version,
+            },
         )
         _emit(args, result, kind="claim")
     elif command == "claim-release":
@@ -391,7 +471,7 @@ def _run_client(args: argparse.Namespace, client: APIClient) -> int:
             "PATCH",
             _claim_path(args) + "/status",
             payload={
-                "status": args.status,
+                "status": CLAIM_STATUS_ALIASES[args.status],
                 "expected_version": args.expected_version,
             },
         )
@@ -482,10 +562,7 @@ def _scope_path(args: argparse.Namespace) -> str:
 
 
 def _claim_queue_path(args: argparse.Namespace) -> str:
-    return (
-        f"/v1/projects/{_segment(args.project)}/"
-        f"{CLAIM_KIND_PATHS[args.kind]}"
-    )
+    return f"/v1/projects/{_segment(args.project)}/{CLAIM_KIND_PATHS[args.kind]}"
 
 
 def _claim_path(args: argparse.Namespace) -> str:
@@ -504,6 +581,50 @@ def _text_argument(args: argparse.Namespace, name: str) -> str | None:
     if file_path is not None:
         return file_path.read_text(encoding="utf-8")
     return None
+
+
+def _read_claim_manifest(source: str) -> list[str]:
+    if source == "-":
+        raw = sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1)
+    else:
+        with Path(source).open("rb") as stream:
+            raw = stream.read(MAX_REQUEST_BYTES + 1)
+    if len(raw) > MAX_REQUEST_BYTES:
+        raise ClientError(f"claim manifest exceeds {MAX_REQUEST_BYTES} bytes")
+    try:
+        text = raw.decode("utf-8", "strict")
+
+        def reject_constant(value: str) -> None:
+            raise ValueError(f"invalid JSON number: {value}")
+
+        def reject_float(_value: str) -> None:
+            raise ValueError("floating-point JSON numbers are not accepted")
+
+        payload = json.loads(
+            text,
+            parse_constant=reject_constant,
+            parse_float=reject_float,
+        )
+    except (UnicodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
+        raise ClientError("claim manifest must be valid UTF-8 JSON") from exc
+    if not isinstance(payload, list):
+        raise ClientError("claim manifest must be a JSON array of identifiers")
+    if len(payload) > MAX_CLAIM_IMPORT_ENTRIES:
+        raise ClientError(
+            f"claim manifest may contain at most {MAX_CLAIM_IMPORT_ENTRIES} identifiers"
+        )
+    external_ids: list[str] = []
+    seen: set[str] = set()
+    for value in payload:
+        try:
+            external_id = validate_external_id(value)
+        except ValidationError as exc:
+            raise ClientError(str(exc)) from exc
+        if external_id in seen:
+            raise ClientError("claim manifest contains duplicate identifiers")
+        seen.add(external_id)
+        external_ids.append(external_id)
+    return external_ids
 
 
 def _read_token(path: Path) -> str:
@@ -663,6 +784,20 @@ def _emit(
         for claim in payload.get("claims", []):
             _print_claim(claim)
         return
+    if kind == "claim-import":
+        meta = payload["trusted_metadata"]
+        action = "would-create" if meta.get("dry_run") else "created"
+        count_key = "would_create_count" if meta.get("dry_run") else "created_count"
+        print(
+            f"[{meta['project_key']}] import {meta['kind']}: "
+            f"requested={meta['requested_count']} {action}={meta[count_key]} "
+            f"unchanged={meta['unchanged_count']}"
+        )
+        for claim in payload.get("created", []):
+            _print_claim(claim)
+        for external_id in payload.get("would_create", []):
+            print(f"  would create {external_id}")
+        return
     if kind == "claim":
         _print_claim(payload)
         return
@@ -685,9 +820,7 @@ def _print_item(payload: dict[str, Any]) -> None:
     print(f"  {meta['creator']['handle']} -> {meta['recipient']['handle']}")
     if meta.get("work_claim") is not None:
         work = meta["work_claim"]
-        print(
-            f"  linked {work['kind']} {work['external_id']} ({work['claim_id']})"
-        )
+        print(f"  linked {work['kind']} {work['external_id']} ({work['claim_id']})")
     flags = payload.get("content_risk_flags", [])
     if flags:
         print("  CONTENT WARNING: " + ", ".join(flags))
@@ -720,9 +853,7 @@ def _print_event(event: dict[str, Any]) -> None:
     print(f"{scope}event#{meta['event_seq']} {meta['kind']} by {actor}{transition}")
     if meta.get("work_claim") is not None:
         work = meta["work_claim"]
-        print(
-            f"  linked {work['kind']} {work['external_id']} ({work['claim_id']})"
-        )
+        print(f"  linked {work['kind']} {work['external_id']} ({work['claim_id']})")
     flags = event.get("content_risk_flags", [])
     if flags:
         print("  CONTENT WARNING: " + ", ".join(flags))

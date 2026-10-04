@@ -12,9 +12,11 @@ user’s queue or open a peer-to-peer connection.
 
 Each project also has two shared claim queues: issues and pull requests. They
 are filtered views over one small local registry, not GitHub integration.
-Project members can register an opaque external identifier and atomically claim
-it for themselves. A work item may carry one immutable link to a registry
-entry.
+Project coordinators and admins can register or additively import opaque
+external identifiers and assign available work. Members can atomically claim
+available work for themselves and submit completed work for independent
+review. A different coordinator or admin returns it for changes or approves
+and completes it. A work item may carry one immutable link to a registry entry.
 
 The v0 daemon binds to `127.0.0.1` by default, uses SQLite, and has no runtime
 package dependencies beyond Python 3.11 or newer. Its explicit container mode
@@ -104,16 +106,20 @@ operator terminal, never from an agent prompt:
 
 ```console
 docker compose --profile admin run --rm krab-admin \
-  admin user-create alice
+  admin user-create owner
 docker compose --profile admin run --rm krab-admin \
-  admin user-create bob
+  admin user-create primary-dev
+docker compose --profile admin run --rm krab-admin \
+  admin user-create worker-one
 
 docker compose --profile admin run --rm krab-admin \
   admin project-create imitation-krab --label "Imitation Krab"
 docker compose --profile admin run --rm krab-admin \
-  admin project-add-user imitation-krab alice --role admin
+  admin project-add-user imitation-krab owner --role admin
 docker compose --profile admin run --rm krab-admin \
-  admin project-add-user imitation-krab bob --role member
+  admin project-add-user imitation-krab primary-dev --role coordinator
+docker compose --profile admin run --rm krab-admin \
+  admin project-add-user imitation-krab worker-one --role member
 ```
 
 Store each returned token in a different owned mode-`0700` directory as a
@@ -129,13 +135,13 @@ docker compose ps
 curl --fail --silent http://127.0.0.1:8765/v1/health
 ```
 
-New images migrate an existing v1 database to v2 at startup without deleting
-users, projects, sessions, or messages. Take a verified backup before updating,
-then rebuild and recreate the service container:
+New images migrate an existing schema 1, 2, or 3 database to schema 4 at startup without
+deleting users, projects, sessions, messages, or claims. Take a verified backup
+before updating, then rebuild and recreate the service container:
 
 ```console
 docker compose --profile admin run --rm krab-admin \
-  admin backup "/var/lib/imitation-krab/backups/krab-before-v2.db"
+  admin backup "/var/lib/imitation-krab/backups/krab-before-v4.db"
 docker compose build --pull
 docker compose up --detach --force-recreate krab
 ```
@@ -177,20 +183,36 @@ administrative CLI:
 ```console
 krab init
 
-krab admin user-create alice \
-  --write-token ~/.config/imitation-krab/alice.token
-krab admin user-create bob \
-  --write-token ~/.config/imitation-krab/bob.token
+krab admin user-create owner \
+  --write-token ~/.config/imitation-krab/owner.token
+krab admin user-create primary-dev \
+  --write-token ~/.config/imitation-krab/primary-dev.token
+krab admin user-create worker-one \
+  --write-token ~/.config/imitation-krab/worker-one.token
 
 krab admin project-create imitation-krab --label "Imitation Krab"
-krab admin project-add-user imitation-krab alice --role admin
-krab admin project-add-user imitation-krab bob --role member
+krab admin project-add-user imitation-krab owner --role admin
+krab admin project-add-user imitation-krab primary-dev --role coordinator
+krab admin project-add-user imitation-krab worker-one --role member
 ```
 
 Token files are created with mode `0600`. The CLI refuses symlinked or
 hard-linked token files, non-owned files, group/world-accessible files, and
 token directories not owned by the current user with mode `0700`. If
 `--write-token` is omitted, the token is printed exactly once.
+
+Project roles are deliberately fixed:
+
+| Role | Project capabilities |
+| --- | --- |
+| `member` | Read claim queues, self-claim, activate or submit assigned work, release claimed/active work, and participate in sessions |
+| `coordinator` | Member capabilities plus claim creation/import, explicit assignment, review of another assignee's work, and stale/review-claim release |
+| `admin` | Coordinator capabilities plus project-level override such as closing another creator's completed session |
+
+No role can create users, rotate credentials, or change membership over HTTP.
+Those operations remain local administrative commands. Keep the human
+administrator's token outside agent workspaces; give the primary development
+agent only the `coordinator` token.
 
 Start the daemon:
 
@@ -208,31 +230,31 @@ the daemon directly on a host.
 Global options such as `--token-file` precede the command:
 
 ```console
-krab --token-file ~/.config/imitation-krab/alice.token \
+krab --token-file ~/.config/imitation-krab/primary-dev.token \
   session-create \
   --project imitation-krab \
   --label "Authentication review" \
-  --participant alice \
-  --participant bob
+  --participant primary-dev \
+  --participant worker-one
 ```
 
 The response contains a server-generated session ID. Use it for every work
 item in that unit of work:
 
 ```console
-krab --token-file ~/.config/imitation-krab/alice.token \
+krab --token-file ~/.config/imitation-krab/primary-dev.token \
   send \
   --project imitation-krab \
   --session ses_0123456789abcdef0123456789abcdef \
-  --to bob \
+  --to worker-one \
   --title "Review authentication changes" \
   --body-file request.txt
 ```
 
-Bob can watch only Bob's private deliveries:
+The worker can watch only its own private deliveries:
 
 ```console
-krab --token-file ~/.config/imitation-krab/bob.token \
+krab --token-file ~/.config/imitation-krab/worker-one.token \
   queue \
   --project imitation-krab \
   --session ses_0123456789abcdef0123456789abcdef \
@@ -248,44 +270,119 @@ The claim registry is deliberately local and cooperative. `external_id` is an
 opaque, unverified identifier containing at most 256 restricted ASCII
 characters. A useful convention is `owner/repository#123`, but the server does
 not parse it, normalize case, contact GitHub, or verify that the object exists.
-Agents are responsible for choosing one canonical identifier.
+Agents are responsible for obtaining upstream data and choosing one canonical
+identifier.
 
-Register and inspect shared project work:
+Only a project coordinator or admin can register identifiers. All project
+members can inspect the queues:
 
 ```console
-krab --token-file ~/.config/imitation-krab/alice.token \
+krab --token-file ~/.config/imitation-krab/primary-dev.token \
   claim-add 'psyberone/imitation-krab#42' \
   --project imitation-krab --kind issue
 
-krab --token-file ~/.config/imitation-krab/bob.token \
+krab --token-file ~/.config/imitation-krab/worker-one.token \
   issues --project imitation-krab
 
-krab --token-file ~/.config/imitation-krab/bob.token \
+krab --token-file ~/.config/imitation-krab/worker-one.token \
   prs --project imitation-krab
+
+krab --token-file ~/.config/imitation-krab/primary-dev.token \
+  issues --project imitation-krab --status under-review
+
+krab --token-file ~/.config/imitation-krab/primary-dev.token \
+  prs --project imitation-krab --status active --assignee worker-one
 ```
 
-The create response contains a `clm_...` identifier and version `1`. Claiming
-always assigns the authenticated caller; there is no arbitrary assignee field:
+Queue filters are optional exact matches. The only filters are one fixed
+status and one syntactically valid assignee handle; they may be combined and
+never widen project or claim-kind visibility.
+
+For first load and refresh, give `claim-import` a JSON array containing only
+identifiers. The command accepts a file path or `-` for standard input:
+
+```json
+[
+  "psyberone/imitation-krab#42",
+  "psyberone/imitation-krab#57"
+]
+```
 
 ```console
-krab --token-file ~/.config/imitation-krab/bob.token \
+krab --token-file ~/.config/imitation-krab/primary-dev.token \
+  claim-import issues.json \
+  --project imitation-krab --kind issue --dry-run
+
+krab --token-file ~/.config/imitation-krab/primary-dev.token \
+  claim-import issues.json \
+  --project imitation-krab --kind issue
+```
+
+An import is atomic, additive, and limited to 100 unique identifiers. Existing
+claims, assignments, and statuses are unchanged. An omitted identifier is
+never treated as deleted, closed, or reassigned, so the same manifest is safe
+to submit again. Titles, bodies, labels, and other upstream prose or metadata
+are not accepted by the import format. URL-like identifiers remain opaque and
+are never fetched or followed.
+
+The create response contains a `clm_...` identifier and version `1`. A
+coordinator or admin can explicitly assign available work to an active member:
+
+```console
+krab --token-file ~/.config/imitation-krab/primary-dev.token \
+  claim-assign clm_0123456789abcdef0123456789abcdef \
+  --project imitation-krab --kind issue --to worker-one --expected-version 1
+```
+
+Assignment changes `available` to `claimed`. It cannot overwrite an existing
+assignee; reassignment requires an explicit release followed by a new
+assignment. Members can alternatively claim available work for themselves:
+
+```console
+krab --token-file ~/.config/imitation-krab/worker-one.token \
   claim clm_0123456789abcdef0123456789abcdef \
   --project imitation-krab --kind issue --expected-version 1
 
-krab --token-file ~/.config/imitation-krab/bob.token \
+krab --token-file ~/.config/imitation-krab/worker-one.token \
   claim-status clm_0123456789abcdef0123456789abcdef active \
   --project imitation-krab --kind issue --expected-version 2
 
-krab --token-file ~/.config/imitation-krab/bob.token \
-  claim-status clm_0123456789abcdef0123456789abcdef done \
+krab --token-file ~/.config/imitation-krab/worker-one.token \
+  claim-status clm_0123456789abcdef0123456789abcdef under-review \
   --project imitation-krab --kind issue --expected-version 3
 ```
 
-The fixed lifecycle is `available → claimed → active → done`.
+The assigned worker has now handed off version 4. A different coordinator or
+admin reviews it. They can request changes:
+
+```console
+krab --token-file ~/.config/imitation-krab/primary-dev.token \
+  claim-status clm_0123456789abcdef0123456789abcdef active \
+  --project imitation-krab --kind issue --expected-version 4
+```
+
+After the assignee resubmits, the reviewer can approve and complete it:
+
+```console
+krab --token-file ~/.config/imitation-krab/primary-dev.token \
+  claim-status clm_0123456789abcdef0123456789abcdef done \
+  --project imitation-krab --kind issue --expected-version 6
+```
+
+The fixed lifecycle is
+`available → claimed → active → under_review → done`, with
+`under_review → active` representing requested changes. Direct
+`active → done` is rejected. The assignee cannot review or approve their own
+claim, even if that identity is also a coordinator or admin.
 The assignee can release `claimed` or `active` work back to `available`; a
-project admin can do the same to recover stale claims. `done` is terminal.
-Every mutation requires the version last observed, and competing claim attempts
-produce one winner.
+project coordinator or admin can also release `under_review` work, atomically
+clearing the review marker. `done` is terminal. Every claim, assignment,
+release, and status mutation requires the version last observed, and competing
+attempts produce one winner.
+
+Review explanations still belong in session work-item messages. Claims do not
+gain prose, labels, priorities, dependencies, reservations, or automatic
+notifications, and Krab neither queries nor mutates GitHub.
 
 Link a message at creation time with `send --claim clm_...`. The link, project,
 kind, and external identifier are immutable. Claim state and message status are
@@ -326,7 +423,7 @@ allowed by the server. `needs-changes` and `closed-rejected` require a note.
 Every update includes the version last observed by the caller:
 
 ```console
-krab --token-file ~/.config/imitation-krab/bob.token \
+krab --token-file ~/.config/imitation-krab/worker-one.token \
   status itm_0123456789abcdef0123456789abcdef in-progress \
   --project imitation-krab \
   --session ses_0123456789abcdef0123456789abcdef \
@@ -348,14 +445,18 @@ use for a safe retry. Reusing a key with different content is rejected.
 
 ```text
 GET   /v1/projects
-GET   /v1/projects/{project}/issues
+GET   /v1/projects/{project}/issues?status=under_review&assignee=worker-one
 POST  /v1/projects/{project}/issues
+POST  /v1/projects/{project}/issues/import
+POST  /v1/projects/{project}/issues/{claim}/assign
 POST  /v1/projects/{project}/issues/{claim}/claim
 POST  /v1/projects/{project}/issues/{claim}/release
 PATCH /v1/projects/{project}/issues/{claim}/status
 
-GET   /v1/projects/{project}/pull-requests
+GET   /v1/projects/{project}/pull-requests?status=active&assignee=worker-one
 POST  /v1/projects/{project}/pull-requests
+POST  /v1/projects/{project}/pull-requests/import
+POST  /v1/projects/{project}/pull-requests/{claim}/assign
 POST  /v1/projects/{project}/pull-requests/{claim}/claim
 POST  /v1/projects/{project}/pull-requests/{claim}/release
 PATCH /v1/projects/{project}/pull-requests/{claim}/status
@@ -399,8 +500,8 @@ does not make its instructions trustworthy.
 
 An `external_id` appears in authenticated metadata because the server has
 validated its restricted representation and immutable registry relationship.
-It is still only a member-supplied local reference, not proof about GitHub or
-permission to perform any external action.
+It is still only a coordinator/admin-supplied local reference, not proof about
+GitHub or permission to perform any external action.
 
 ## Limits
 
@@ -414,6 +515,7 @@ permission to perform any external action.
 - Active sessions created by one user in one project: 50
 - Events per work item: 128, with a terminal transition still permitted
 - External work identifier: 256 restricted ASCII characters
+- Identifiers per additive import: 100
 - Work claims per project: 10,000
 - SQLite database: 256 MiB maximum
 - Reminder cooldown: 60 seconds per sender and item

@@ -18,7 +18,7 @@ from .config import MAX_DATABASE_BYTES, default_db_path, default_pepper_path
 from .sanitize import sanitize_text, validate_handle, validate_project_key
 
 TOKEN_RE = re.compile(r"^krab_(usr_[0-9a-f]{32})_([A-Za-z0-9_-]{43})$")
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 
 SCHEMA = """
@@ -53,6 +53,15 @@ CREATE TABLE IF NOT EXISTS project_members (
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE RESTRICT
 );
 
+CREATE TABLE IF NOT EXISTS project_coordinators (
+    project_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (project_id, user_id),
+    FOREIGN KEY (project_id, user_id)
+        REFERENCES project_members(project_id, user_id) ON DELETE RESTRICT
+);
+
 CREATE TABLE IF NOT EXISTS work_claims (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL,
@@ -76,6 +85,18 @@ CREATE TABLE IF NOT EXISTS work_claims (
     FOREIGN KEY (project_id, assignee_id)
         REFERENCES project_members(project_id, user_id) ON DELETE RESTRICT,
     FOREIGN KEY (project_id, created_by)
+        REFERENCES project_members(project_id, user_id) ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS work_claim_review_requests (
+    project_id TEXT NOT NULL,
+    claim_id TEXT NOT NULL,
+    submitted_by TEXT NOT NULL,
+    submitted_at TEXT NOT NULL,
+    PRIMARY KEY (project_id, claim_id),
+    FOREIGN KEY (project_id, claim_id)
+        REFERENCES work_claims(project_id, id) ON DELETE RESTRICT,
+    FOREIGN KEY (project_id, submitted_by)
         REFERENCES project_members(project_id, user_id) ON DELETE RESTRICT
 );
 
@@ -312,6 +333,37 @@ MIGRATION_1_TO_2 = (
 )
 
 
+MIGRATION_2_TO_3 = (
+    """
+    CREATE TABLE project_coordinators (
+        project_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (project_id, user_id),
+        FOREIGN KEY (project_id, user_id)
+            REFERENCES project_members(project_id, user_id) ON DELETE RESTRICT
+    )
+    """,
+)
+
+
+MIGRATION_3_TO_4 = (
+    """
+    CREATE TABLE work_claim_review_requests (
+        project_id TEXT NOT NULL,
+        claim_id TEXT NOT NULL,
+        submitted_by TEXT NOT NULL,
+        submitted_at TEXT NOT NULL,
+        PRIMARY KEY (project_id, claim_id),
+        FOREIGN KEY (project_id, claim_id)
+            REFERENCES work_claims(project_id, id) ON DELETE RESTRICT,
+        FOREIGN KEY (project_id, submitted_by)
+            REFERENCES project_members(project_id, user_id) ON DELETE RESTRICT
+    )
+    """,
+)
+
+
 class DatabaseError(RuntimeError):
     pass
 
@@ -406,7 +458,7 @@ class Database:
         version = rows[0]["version"]
         if version == SCHEMA_VERSION:
             return
-        if version != 1:
+        if version not in {1, 2, 3}:
             raise DatabaseError("unsupported database schema version")
 
         try:
@@ -415,17 +467,25 @@ class Database:
             if len(locked_rows) != 1:
                 raise DatabaseError("database schema metadata is invalid")
             locked_version = locked_rows[0]["version"]
-            if locked_version == SCHEMA_VERSION:
-                conn.commit()
-                return
-            if locked_version != 1:
+            if locked_version not in {1, 2, 3, SCHEMA_VERSION}:
                 raise DatabaseError("unsupported database schema version")
-            for statement in MIGRATION_1_TO_2:
-                conn.execute(statement)
-            conn.execute(
-                "UPDATE schema_meta SET version = ? WHERE version = 1",
-                (SCHEMA_VERSION,),
-            )
+            if locked_version == 1:
+                for statement in MIGRATION_1_TO_2:
+                    conn.execute(statement)
+                conn.execute("UPDATE schema_meta SET version = 2 WHERE version = 1")
+                locked_version = 2
+            if locked_version == 2:
+                for statement in MIGRATION_2_TO_3:
+                    conn.execute(statement)
+                conn.execute("UPDATE schema_meta SET version = 3 WHERE version = 2")
+                locked_version = 3
+            if locked_version == 3:
+                for statement in MIGRATION_3_TO_4:
+                    conn.execute(statement)
+                conn.execute(
+                    "UPDATE schema_meta SET version = ? WHERE version = 3",
+                    (SCHEMA_VERSION,),
+                )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -632,8 +692,8 @@ class Database:
     ) -> dict[str, Any]:
         project_key = validate_project_key(project_key)
         handle = validate_handle(handle)
-        if role not in {"member", "admin"}:
-            raise DatabaseError("role must be member or admin")
+        if role not in {"member", "coordinator", "admin"}:
+            raise DatabaseError("role must be member, coordinator, or admin")
         conn = self.connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -648,14 +708,29 @@ class Database:
             if user is None or not user["active"]:
                 raise DatabaseError("active user not found")
             now = self.now()
+            stored_role = "member" if role == "coordinator" else role
             conn.execute(
                 """
                 INSERT INTO project_members(project_id, user_id, role, created_at)
                 VALUES (?, ?, ?, ?)
                 ON CONFLICT(project_id, user_id) DO UPDATE SET role = excluded.role
                 """,
-                (project["id"], user["id"], role, now),
+                (project["id"], user["id"], stored_role, now),
             )
+            if role == "coordinator":
+                conn.execute(
+                    """
+                    INSERT INTO project_coordinators(project_id, user_id, created_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(project_id, user_id) DO NOTHING
+                    """,
+                    (project["id"], user["id"], now),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM project_coordinators WHERE project_id = ? AND user_id = ?",
+                    (project["id"], user["id"]),
+                )
             self._audit(
                 conn,
                 None,

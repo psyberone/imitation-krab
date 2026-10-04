@@ -66,9 +66,11 @@ class HTTPAPITests(unittest.TestCase):
         self.db.initialize()
         _, self.alice_token = self.db.create_user("alice")
         _, self.bob_token = self.db.create_user("bob")
+        _, self.primary_token = self.db.create_user("primary-dev")
         self.db.create_project("project-one", "Project One")
         self.db.add_project_member("project-one", "alice", "admin")
         self.db.add_project_member("project-one", "bob", "member")
+        self.db.add_project_member("project-one", "primary-dev", "coordinator")
         self.server = type("InProcessServer", (), {})()
         self.server.database = self.db
         self.server.service = Service(self.db)
@@ -333,6 +335,172 @@ class HTTPAPITests(unittest.TestCase):
             linked["trusted_metadata"]["work_claim"]["external_id"],
             "owner/repository#321",
         )
+
+    def test_http_coordinator_import_and_assignment_boundaries(self) -> None:
+        issue_path = "/v1/projects/project-one/issues"
+        status, denied, _ = self.request(
+            "POST",
+            issue_path,
+            self.bob_token,
+            {"external_id": "owner/repository#401"},
+            key="http-member-create-denied-0001",
+        )
+        self.assertEqual(status, 403, denied)
+
+        manifest = {"external_ids": ["owner/repository#401", "owner/repository#402"]}
+        status, imported, _ = self.request(
+            "POST",
+            f"{issue_path}/import",
+            self.primary_token,
+            manifest,
+            key="http-coordinator-import-0001",
+        )
+        self.assertEqual(status, 200, imported)
+        self.assertEqual(imported["trusted_metadata"]["created_count"], 2)
+        claim_id = imported["created"][0]["trusted_metadata"]["claim_id"]
+
+        status, assigned, _ = self.request(
+            "POST",
+            f"{issue_path}/{claim_id}/assign",
+            self.primary_token,
+            {"assignee": "bob", "expected_version": 1},
+            key="http-coordinator-assign-0001",
+        )
+        self.assertEqual(status, 200, assigned)
+        self.assertEqual(assigned["trusted_metadata"]["status"], "claimed")
+        self.assertEqual(assigned["trusted_metadata"]["assignee"]["handle"], "bob")
+
+        status, conflict, _ = self.request(
+            "POST",
+            f"{issue_path}/{claim_id}/assign",
+            self.alice_token,
+            {"assignee": "alice", "expected_version": 2},
+            key="http-admin-reassign-denied-0001",
+        )
+        self.assertEqual(status, 409, conflict)
+        self.assertEqual(conflict["error"]["code"], "already_claimed")
+
+        status, refreshed, _ = self.request(
+            "POST",
+            f"{issue_path}/import",
+            self.primary_token,
+            manifest,
+            key="http-coordinator-import-0002",
+        )
+        self.assertEqual(status, 200, refreshed)
+        self.assertEqual(refreshed["trusted_metadata"]["created_count"], 0)
+        self.assertEqual(refreshed["trusted_metadata"]["unchanged_count"], 2)
+
+    def test_http_review_handoff_and_claim_filters(self) -> None:
+        issue_path = "/v1/projects/project-one/issues"
+        status, imported, _ = self.request(
+            "POST",
+            f"{issue_path}/import",
+            self.primary_token,
+            {"external_ids": ["owner/repository#501"]},
+            key="http-review-import-0001",
+        )
+        self.assertEqual(status, 200, imported)
+        claim_id = imported["created"][0]["trusted_metadata"]["claim_id"]
+
+        status, assigned, _ = self.request(
+            "POST",
+            f"{issue_path}/{claim_id}/assign",
+            self.primary_token,
+            {"assignee": "bob", "expected_version": 1},
+            key="http-review-assign-0001",
+        )
+        self.assertEqual(status, 200, assigned)
+
+        status, active, _ = self.request(
+            "PATCH",
+            f"{issue_path}/{claim_id}/status",
+            self.bob_token,
+            {"status": "active", "expected_version": 2},
+            key="http-review-active-0001",
+        )
+        self.assertEqual(status, 200, active)
+
+        status, review, _ = self.request(
+            "PATCH",
+            f"{issue_path}/{claim_id}/status",
+            self.bob_token,
+            {"status": "under_review", "expected_version": 3},
+            key="http-review-submit-0001",
+        )
+        self.assertEqual(status, 200, review)
+        self.assertEqual(review["trusted_metadata"]["status"], "under_review")
+
+        status, filtered, _ = self.request(
+            "GET",
+            f"{issue_path}?status=under_review&assignee=bob",
+            self.primary_token,
+        )
+        self.assertEqual(status, 200, filtered)
+        self.assertEqual(len(filtered["claims"]), 1)
+        self.assertEqual(
+            filtered["claims"][0]["trusted_metadata"]["claim_id"], claim_id
+        )
+
+        status, denied, _ = self.request(
+            "PATCH",
+            f"{issue_path}/{claim_id}/status",
+            self.bob_token,
+            {"status": "done", "expected_version": 4},
+            key="http-review-self-approve-0001",
+        )
+        self.assertEqual(status, 403, denied)
+        self.assertEqual(denied["error"]["code"], "self_approval")
+
+        status, changes, _ = self.request(
+            "PATCH",
+            f"{issue_path}/{claim_id}/status",
+            self.primary_token,
+            {"status": "active", "expected_version": 4},
+            key="http-review-changes-0001",
+        )
+        self.assertEqual(status, 200, changes)
+        status, resubmitted, _ = self.request(
+            "PATCH",
+            f"{issue_path}/{claim_id}/status",
+            self.bob_token,
+            {"status": "under_review", "expected_version": 5},
+            key="http-review-submit-0002",
+        )
+        self.assertEqual(status, 200, resubmitted)
+        status, approved, _ = self.request(
+            "PATCH",
+            f"{issue_path}/{claim_id}/status",
+            self.primary_token,
+            {"status": "done", "expected_version": 6},
+            key="http-review-approve-0001",
+        )
+        self.assertEqual(status, 200, approved)
+        self.assertEqual(approved["trusted_metadata"]["status"], "done")
+
+        status, done, _ = self.request(
+            "GET", f"{issue_path}?status=done&assignee=bob", self.alice_token
+        )
+        self.assertEqual(status, 200, done)
+        self.assertEqual(len(done["claims"]), 1)
+        status, empty, _ = self.request(
+            "GET", f"{issue_path}?assignee=nobody", self.alice_token
+        )
+        self.assertEqual(status, 200, empty)
+        self.assertEqual(empty["claims"], [])
+
+        for query, code in (
+            ("status=blocked", "invalid_status"),
+            ("assignee=bad%20handle", "validation_error"),
+            ("status=done&status=active", "invalid_query"),
+            ("label=urgent", "invalid_query"),
+        ):
+            with self.subTest(query=query):
+                status, invalid, _ = self.request(
+                    "GET", f"{issue_path}?{query}", self.alice_token
+                )
+                self.assertEqual(status, 400, invalid)
+                self.assertEqual(invalid["error"]["code"], code)
 
     def test_mutation_requires_idempotency_key(self) -> None:
         body = json.dumps({"label": "No key", "participants": ["alice"]}).encode()

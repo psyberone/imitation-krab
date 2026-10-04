@@ -12,7 +12,9 @@ from imitation_krab.cli import (
     APIClient,
     ClientError,
     _print_item,
+    _read_claim_manifest,
     _read_token,
+    _run_client,
     _write_token,
     build_parser,
     main,
@@ -36,8 +38,20 @@ class SanitizeTests(unittest.TestCase):
         self.assertEqual(backup.destination, Path("/private/backup.db"))
 
     def test_claim_commands_are_small_and_explicit(self) -> None:
-        issues = build_parser().parse_args(["issues", "--project", "project-one"])
+        issues = build_parser().parse_args(
+            [
+                "issues",
+                "--project",
+                "project-one",
+                "--status",
+                "under-review",
+                "--assignee",
+                "bob",
+            ]
+        )
         self.assertEqual(issues.command, "issues")
+        self.assertEqual(issues.status, "under-review")
+        self.assertEqual(issues.assignee, "bob")
 
         add = build_parser().parse_args(
             [
@@ -51,6 +65,48 @@ class SanitizeTests(unittest.TestCase):
         )
         self.assertEqual(add.external_id, "owner/repository#123")
         self.assertEqual(add.kind, "pr")
+
+        claim_import = build_parser().parse_args(
+            [
+                "claim-import",
+                "issues.json",
+                "--project",
+                "project-one",
+                "--kind",
+                "issue",
+                "--dry-run",
+            ]
+        )
+        self.assertEqual(claim_import.manifest, "issues.json")
+        self.assertTrue(claim_import.dry_run)
+
+        assignment = build_parser().parse_args(
+            [
+                "claim-assign",
+                "clm_" + "d" * 32,
+                "--project",
+                "project-one",
+                "--kind",
+                "issue",
+                "--to",
+                "bob",
+                "--expected-version",
+                "1",
+            ]
+        )
+        self.assertEqual(assignment.to, "bob")
+
+        coordinator = build_parser().parse_args(
+            [
+                "admin",
+                "project-add-user",
+                "project-one",
+                "primary-dev",
+                "--role",
+                "coordinator",
+            ]
+        )
+        self.assertEqual(coordinator.role, "coordinator")
 
         send = build_parser().parse_args(
             [
@@ -70,6 +126,103 @@ class SanitizeTests(unittest.TestCase):
             ]
         )
         self.assertEqual(send.claim, "clm_" + "b" * 32)
+
+        review = build_parser().parse_args(
+            [
+                "claim-status",
+                "clm_" + "c" * 32,
+                "under-review",
+                "--project",
+                "project-one",
+                "--kind",
+                "issue",
+                "--expected-version",
+                "3",
+            ]
+        )
+        self.assertEqual(review.status, "under-review")
+
+    def test_claim_cli_maps_filters_and_review_status_to_api_values(self) -> None:
+        class RecordingClient:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str, dict]] = []
+
+            def request(self, method: str, path: str, **kwargs: object) -> dict:
+                self.calls.append((method, path, kwargs))
+                return {"claims": []}
+
+        client = RecordingClient()
+        args = build_parser().parse_args(
+            [
+                "--json",
+                "prs",
+                "--project",
+                "project-one",
+                "--status",
+                "under-review",
+                "--assignee",
+                "bob",
+            ]
+        )
+        with redirect_stdout(StringIO()):
+            _run_client(args, client)  # type: ignore[arg-type]
+        self.assertEqual(
+            client.calls,
+            [
+                (
+                    "GET",
+                    "/v1/projects/project-one/pull-requests",
+                    {"query": {"status": "under_review", "assignee": "bob"}},
+                )
+            ],
+        )
+
+        client.calls.clear()
+        args = build_parser().parse_args(
+            [
+                "--json",
+                "claim-status",
+                "clm_" + "d" * 32,
+                "under-review",
+                "--project",
+                "project-one",
+                "--kind",
+                "issue",
+                "--expected-version",
+                "3",
+            ]
+        )
+        with redirect_stdout(StringIO()):
+            _run_client(args, client)  # type: ignore[arg-type]
+        self.assertEqual(
+            client.calls[0][2]["payload"],
+            {"status": "under_review", "expected_version": 3},
+        )
+
+    def test_claim_manifest_is_a_bounded_array_of_safe_unique_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "issues.json"
+            manifest.write_text(
+                '["owner/repository#1","owner/repository#2"]', encoding="utf-8"
+            )
+            self.assertEqual(
+                _read_claim_manifest(str(manifest)),
+                ["owner/repository#1", "owner/repository#2"],
+            )
+
+            manifest.write_text(
+                '["owner/repository#1","owner/repository#1"]', encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ClientError, "duplicate"):
+                _read_claim_manifest(str(manifest))
+
+            manifest.write_text('{"external_ids": []}', encoding="utf-8")
+            with self.assertRaisesRegex(ClientError, "JSON array"):
+                _read_claim_manifest(str(manifest))
+
+            manifest.write_text('["owner/repository#1", 2]', encoding="utf-8")
+            with self.assertRaisesRegex(ClientError, "restricted ASCII"):
+                _read_claim_manifest(str(manifest))
 
     def test_external_ids_are_restricted_ascii_and_claim_ids_are_valid(self) -> None:
         for value in ("123", "PROJ-123", "owner/repository#123", "repo:issue/123"):

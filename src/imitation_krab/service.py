@@ -12,6 +12,7 @@ from typing import Any
 from .config import (
     MAX_ACTIVE_SESSIONS_PER_USER,
     MAX_BODY_BYTES,
+    MAX_CLAIM_IMPORT_ENTRIES,
     MAX_EVENTS_PER_ITEM,
     MAX_LABEL_BYTES,
     MAX_LONG_POLL_SECONDS,
@@ -66,7 +67,9 @@ CREATOR_TRANSITIONS = {
 }
 
 WORK_KINDS = {"issue", "pull_request"}
-WORK_STATUS_TRANSITIONS = {("claimed", "active"), ("active", "done")}
+WORK_STATUSES = {"available", "claimed", "active", "under_review", "done"}
+WORK_STATUS_TARGETS = {"active", "under_review", "done"}
+COORDINATION_ROLES = {"coordinator", "admin"}
 
 
 class ServiceError(RuntimeError):
@@ -93,9 +96,19 @@ class Service:
         try:
             rows = conn.execute(
                 """
-                SELECT p.id, p.project_key, p.label, pm.role
+                SELECT
+                    p.id,
+                    p.project_key,
+                    p.label,
+                    CASE
+                        WHEN pm.role = 'admin' THEN 'admin'
+                        WHEN pc.user_id IS NOT NULL THEN 'coordinator'
+                        ELSE 'member'
+                    END AS role
                 FROM project_members pm
                 JOIN projects p ON p.id = pm.project_id
+                LEFT JOIN project_coordinators pc
+                  ON pc.project_id = pm.project_id AND pc.user_id = pm.user_id
                 WHERE pm.user_id = ?
                 ORDER BY p.project_key
                 """,
@@ -123,10 +136,20 @@ class Service:
         }
 
     def list_work_claims(
-        self, actor: dict[str, Any], project_key: str, kind: str
+        self,
+        actor: dict[str, Any],
+        project_key: str,
+        kind: str,
+        *,
+        status: str | None = None,
+        assignee: str | None = None,
     ) -> dict[str, Any]:
         project_key = self._valid_project_key(project_key)
         kind = self._valid_work_kind(kind)
+        if status is not None:
+            status = self._valid_work_status(status)
+        if assignee is not None:
+            assignee = self._valid_handle(assignee)
         conn = self.db.connect()
         try:
             project = self._project_membership(conn, actor["id"], project_key)
@@ -134,23 +157,40 @@ class Service:
                 """
                 SELECT
                     wc.*,
+                    CASE
+                        WHEN review.claim_id IS NOT NULL THEN 'under_review'
+                        ELSE wc.status
+                    END AS effective_status,
+                    review.submitted_by AS review_submitted_by,
+                    review.submitted_at AS review_submitted_at,
                     creator.handle AS creator_handle,
                     assignee.handle AS assignee_handle
                 FROM work_claims wc
+                LEFT JOIN work_claim_review_requests review
+                  ON review.project_id = wc.project_id AND review.claim_id = wc.id
                 JOIN users creator ON creator.id = wc.created_by
                 LEFT JOIN users assignee ON assignee.id = wc.assignee_id
                 WHERE wc.project_id = ? AND wc.kind = ?
+                  AND (
+                    ? IS NULL OR
+                    CASE
+                        WHEN review.claim_id IS NOT NULL THEN 'under_review'
+                        ELSE wc.status
+                    END = ?
+                  )
+                  AND (? IS NULL OR assignee.handle = ?)
                 ORDER BY
-                    CASE wc.status
-                        WHEN 'active' THEN 0
-                        WHEN 'claimed' THEN 1
-                        WHEN 'available' THEN 2
-                        ELSE 3
+                    CASE
+                        WHEN review.claim_id IS NOT NULL THEN 0
+                        WHEN wc.status = 'active' THEN 1
+                        WHEN wc.status = 'claimed' THEN 2
+                        WHEN wc.status = 'available' THEN 3
+                        ELSE 4
                     END,
                     wc.updated_at DESC,
                     wc.id
                 """,
-                (project["id"], kind),
+                (project["id"], kind, status, status, assignee, assignee),
             ).fetchall()
         finally:
             conn.close()
@@ -160,9 +200,7 @@ class Service:
                 "kind": kind,
                 "count": len(rows),
             },
-            "claims": [
-                self._serialize_work_claim(row, project_key) for row in rows
-            ],
+            "claims": [self._serialize_work_claim(row, project_key) for row in rows],
         }
 
     def create_work_claim(
@@ -189,6 +227,7 @@ class Service:
 
             def mutate() -> tuple[int, dict[str, Any]]:
                 project = self._project_membership(conn, actor["id"], project_key)
+                self._require_coordinator(project)
                 duplicate = conn.execute(
                     """
                     SELECT 1 FROM work_claims
@@ -242,10 +281,133 @@ class Service:
                         "external_id": external_id,
                     },
                 )
-                row = self._work_claim_row(
-                    conn, project["id"], kind, claim_id
-                )
+                row = self._work_claim_row(conn, project["id"], kind, claim_id)
                 return 201, self._serialize_work_claim(row, project_key)
+
+            result = self._idempotent(
+                conn, actor["id"], key, operation, canonical, mutate
+            )
+            conn.commit()
+            return result
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def import_work_claims(
+        self,
+        actor: dict[str, Any],
+        project_key: str,
+        kind: str,
+        payload: dict[str, Any],
+        idempotency_key: str,
+    ) -> MutationResult:
+        project_key = self._valid_project_key(project_key)
+        kind = self._valid_work_kind(kind)
+        self._require_fields(payload, required={"external_ids"})
+        values = payload["external_ids"]
+        if not isinstance(values, list):
+            raise ServiceError(
+                400, "invalid_import", "external_ids must be a JSON array"
+            )
+        if len(values) > MAX_CLAIM_IMPORT_ENTRIES:
+            raise ServiceError(
+                400,
+                "import_limit",
+                f"an import may contain at most {MAX_CLAIM_IMPORT_ENTRIES} identifiers",
+            )
+        external_ids: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            try:
+                external_id = validate_external_id(value)
+            except ValidationError as exc:
+                raise self._validation_error(exc) from exc
+            if external_id in seen:
+                raise ServiceError(
+                    400,
+                    "duplicate_reference",
+                    "an import must not contain duplicate identifiers",
+                )
+            seen.add(external_id)
+            external_ids.append(external_id)
+
+        key = self._valid_idempotency_key(idempotency_key)
+        canonical = {"external_ids": external_ids}
+        operation = f"work_claim.import:{project_key}:{kind}"
+        conn = self.db.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+
+            def mutate() -> tuple[int, dict[str, Any]]:
+                project = self._project_membership(conn, actor["id"], project_key)
+                self._require_coordinator(project)
+                rows = conn.execute(
+                    """
+                    SELECT external_id FROM work_claims
+                    WHERE project_id = ? AND kind = ?
+                    """,
+                    (project["id"], kind),
+                ).fetchall()
+                registered = {row["external_id"] for row in rows}
+                existing = set(external_ids) & registered
+                missing = [value for value in external_ids if value not in existing]
+                claim_count = conn.execute(
+                    "SELECT COUNT(*) AS count FROM work_claims WHERE project_id = ?",
+                    (project["id"],),
+                ).fetchone()["count"]
+                if claim_count + len(missing) > MAX_WORK_CLAIMS_PER_PROJECT:
+                    raise ServiceError(
+                        429, "claim_limit", "project work-claim limit reached"
+                    )
+
+                now = self.db.now()
+                created: list[dict[str, Any]] = []
+                for external_id in missing:
+                    claim_id = self.db.new_id("clm")
+                    conn.execute(
+                        """
+                        INSERT INTO work_claims(
+                            id, project_id, kind, external_id, status, version,
+                            created_by, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, 'available', 1, ?, ?, ?)
+                        """,
+                        (
+                            claim_id,
+                            project["id"],
+                            kind,
+                            external_id,
+                            actor["id"],
+                            now,
+                            now,
+                        ),
+                    )
+                    self.db._audit(
+                        conn,
+                        actor["id"],
+                        "work_claim.created",
+                        claim_id,
+                        {
+                            "project_id": project["id"],
+                            "kind": kind,
+                            "external_id": external_id,
+                            "source": "import",
+                        },
+                    )
+                    row = self._work_claim_row(conn, project["id"], kind, claim_id)
+                    created.append(self._serialize_work_claim(row, project_key))
+
+                return 200, {
+                    "trusted_metadata": {
+                        "project_key": project_key,
+                        "kind": kind,
+                        "requested_count": len(external_ids),
+                        "created_count": len(created),
+                        "unchanged_count": len(existing),
+                    },
+                    "created": created,
+                }
 
             result = self._idempotent(
                 conn, actor["id"], key, operation, canonical, mutate
@@ -281,9 +443,7 @@ class Service:
 
             def mutate() -> tuple[int, dict[str, Any]]:
                 project = self._project_membership(conn, actor["id"], project_key)
-                claim = self._work_claim_row(
-                    conn, project["id"], kind, claim_id
-                )
+                claim = self._work_claim_row(conn, project["id"], kind, claim_id)
                 self._require_claim_version(claim, version)
                 if claim["status"] != "available":
                     raise ServiceError(
@@ -318,9 +478,103 @@ class Service:
                     claim_id,
                     {"project_id": project["id"], "kind": kind},
                 )
-                updated = self._work_claim_row(
-                    conn, project["id"], kind, claim_id
+                updated = self._work_claim_row(conn, project["id"], kind, claim_id)
+                return 200, self._serialize_work_claim(updated, project_key)
+
+            result = self._idempotent(
+                conn, actor["id"], key, operation, canonical, mutate
+            )
+            conn.commit()
+            return result
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def assign_work(
+        self,
+        actor: dict[str, Any],
+        project_key: str,
+        kind: str,
+        claim_id: str,
+        payload: dict[str, Any],
+        idempotency_key: str,
+    ) -> MutationResult:
+        project_key = self._valid_project_key(project_key)
+        kind = self._valid_work_kind(kind)
+        claim_id = self._valid_object_id(claim_id, "clm")
+        self._require_fields(payload, required={"assignee", "expected_version"})
+        assignee_handle = self._valid_handle(payload["assignee"])
+        version = self._valid_expected_version(payload["expected_version"])
+        key = self._valid_idempotency_key(idempotency_key)
+        canonical = {
+            "assignee": assignee_handle,
+            "expected_version": version,
+        }
+        operation = f"work_claim.assign:{project_key}:{kind}:{claim_id}"
+        conn = self.db.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+
+            def mutate() -> tuple[int, dict[str, Any]]:
+                project = self._project_membership(conn, actor["id"], project_key)
+                self._require_coordinator(project)
+                assignee = conn.execute(
+                    """
+                    SELECT u.id, u.handle
+                    FROM project_members pm
+                    JOIN users u ON u.id = pm.user_id
+                    WHERE pm.project_id = ? AND u.handle = ? AND u.active = 1
+                    """,
+                    (project["id"], assignee_handle),
+                ).fetchone()
+                if assignee is None:
+                    raise ServiceError(
+                        404,
+                        "assignee_not_found",
+                        "active assignee is not a member of this project",
+                    )
+                claim = self._work_claim_row(conn, project["id"], kind, claim_id)
+                self._require_claim_version(claim, version)
+                if claim["status"] != "available":
+                    raise ServiceError(
+                        409, "already_claimed", "work is not available to assign"
+                    )
+                now = self.db.now()
+                cursor = conn.execute(
+                    """
+                    UPDATE work_claims
+                    SET assignee_id = ?, status = 'claimed',
+                        version = version + 1, updated_at = ?
+                    WHERE id = ? AND project_id = ? AND kind = ?
+                      AND status = 'available' AND assignee_id IS NULL AND version = ?
+                    """,
+                    (
+                        assignee["id"],
+                        now,
+                        claim_id,
+                        project["id"],
+                        kind,
+                        version,
+                    ),
                 )
+                if cursor.rowcount != 1:
+                    raise ServiceError(
+                        409, "version_conflict", "work-claim version has changed"
+                    )
+                self.db._audit(
+                    conn,
+                    actor["id"],
+                    "work_claim.assigned",
+                    claim_id,
+                    {
+                        "project_id": project["id"],
+                        "kind": kind,
+                        "assignee_id": assignee["id"],
+                    },
+                )
+                updated = self._work_claim_row(conn, project["id"], kind, claim_id)
                 return 200, self._serialize_work_claim(updated, project_key)
 
             result = self._idempotent(
@@ -357,24 +611,25 @@ class Service:
 
             def mutate() -> tuple[int, dict[str, Any]]:
                 project = self._project_membership(conn, actor["id"], project_key)
-                claim = self._work_claim_row(
-                    conn, project["id"], kind, claim_id
-                )
+                claim = self._work_claim_row(conn, project["id"], kind, claim_id)
                 self._require_claim_version(claim, version)
-                if claim["status"] not in {"claimed", "active"}:
+                effective_status = claim["effective_status"]
+                if effective_status not in {"claimed", "active", "under_review"}:
                     raise ServiceError(
                         409,
                         "invalid_transition",
-                        "only claimed or active work can be released",
+                        "only claimed, active, or under-review work can be released",
                     )
-                if (
+                if effective_status == "under_review":
+                    self._require_coordinator(project)
+                elif (
                     claim["assignee_id"] != actor["id"]
-                    and project["role"] != "admin"
+                    and project["role"] not in COORDINATION_ROLES
                 ):
                     raise ServiceError(
                         403,
                         "forbidden",
-                        "only the assignee or a project admin may release work",
+                        "only the assignee, a coordinator, or an admin may release work",
                     )
                 previous_assignee = claim["assignee_id"]
                 now = self.db.now()
@@ -392,6 +647,19 @@ class Service:
                     raise ServiceError(
                         409, "version_conflict", "work-claim version has changed"
                     )
+                review_cleared = effective_status == "under_review"
+                if review_cleared:
+                    deleted = conn.execute(
+                        "DELETE FROM work_claim_review_requests "
+                        "WHERE project_id = ? AND claim_id = ?",
+                        (project["id"], claim_id),
+                    )
+                    if deleted.rowcount != 1:
+                        raise ServiceError(
+                            409,
+                            "version_conflict",
+                            "work-claim review state has changed",
+                        )
                 self.db._audit(
                     conn,
                     actor["id"],
@@ -401,11 +669,10 @@ class Service:
                         "project_id": project["id"],
                         "kind": kind,
                         "previous_assignee_id": previous_assignee,
+                        "review_cleared": review_cleared,
                     },
                 )
-                updated = self._work_claim_row(
-                    conn, project["id"], kind, claim_id
-                )
+                updated = self._work_claim_row(conn, project["id"], kind, claim_id)
                 return 200, self._serialize_work_claim(updated, project_key)
 
             result = self._idempotent(
@@ -433,9 +700,11 @@ class Service:
         claim_id = self._valid_object_id(claim_id, "clm")
         self._require_fields(payload, required={"status", "expected_version"})
         status = payload["status"]
-        if status not in {"active", "done"}:
+        if status not in WORK_STATUS_TARGETS:
             raise ServiceError(
-                400, "invalid_status", "status must be active or done"
+                400,
+                "invalid_status",
+                "status must be active, under_review, or done",
             )
         version = self._valid_expected_version(payload["expected_version"])
         key = self._valid_idempotency_key(idempotency_key)
@@ -447,50 +716,113 @@ class Service:
 
             def mutate() -> tuple[int, dict[str, Any]]:
                 project = self._project_membership(conn, actor["id"], project_key)
-                claim = self._work_claim_row(
-                    conn, project["id"], kind, claim_id
-                )
+                claim = self._work_claim_row(conn, project["id"], kind, claim_id)
                 self._require_claim_version(claim, version)
-                if claim["assignee_id"] != actor["id"]:
-                    raise ServiceError(
-                        403,
-                        "forbidden",
-                        "only the assignee may advance claimed work",
+                current_status = claim["effective_status"]
+                now = self.db.now()
+                audit_action: str
+
+                if current_status == "claimed" and status == "active":
+                    if claim["assignee_id"] != actor["id"]:
+                        raise ServiceError(
+                            403,
+                            "forbidden",
+                            "only the assignee may activate claimed work",
+                        )
+                    stored_status = "active"
+                    audit_action = "work_claim.status_changed"
+                elif current_status == "active" and status == "under_review":
+                    if claim["assignee_id"] != actor["id"]:
+                        raise ServiceError(
+                            403,
+                            "forbidden",
+                            "only the assignee may submit work for review",
+                        )
+                    stored_status = "active"
+                    audit_action = "work_claim.submitted"
+                elif current_status == "under_review" and status in {"active", "done"}:
+                    if claim["assignee_id"] == actor["id"]:
+                        if status == "done":
+                            raise ServiceError(
+                                403,
+                                "self_approval",
+                                "an assignee cannot approve their own work",
+                            )
+                        raise ServiceError(
+                            403,
+                            "forbidden",
+                            "an assignee cannot review their own work",
+                        )
+                    self._require_coordinator(project)
+                    stored_status = status
+                    audit_action = (
+                        "work_claim.approved"
+                        if status == "done"
+                        else "work_claim.changes_requested"
                     )
-                if (claim["status"], status) not in WORK_STATUS_TRANSITIONS:
+                else:
                     raise ServiceError(
                         409,
                         "invalid_transition",
                         "work-claim status transition is not permitted",
                     )
-                now = self.db.now()
+
                 cursor = conn.execute(
                     """
                     UPDATE work_claims
                     SET status = ?, version = version + 1, updated_at = ?
                     WHERE id = ? AND project_id = ? AND kind = ? AND version = ?
+                      AND status = ?
                     """,
-                    (status, now, claim_id, project["id"], kind, version),
+                    (
+                        stored_status,
+                        now,
+                        claim_id,
+                        project["id"],
+                        kind,
+                        version,
+                        claim["status"],
+                    ),
                 )
                 if cursor.rowcount != 1:
                     raise ServiceError(
                         409, "version_conflict", "work-claim version has changed"
                     )
+
+                if current_status == "active" and status == "under_review":
+                    conn.execute(
+                        """
+                        INSERT INTO work_claim_review_requests(
+                            project_id, claim_id, submitted_by, submitted_at
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (project["id"], claim_id, actor["id"], now),
+                    )
+                elif current_status == "under_review":
+                    deleted = conn.execute(
+                        "DELETE FROM work_claim_review_requests "
+                        "WHERE project_id = ? AND claim_id = ?",
+                        (project["id"], claim_id),
+                    )
+                    if deleted.rowcount != 1:
+                        raise ServiceError(
+                            409,
+                            "version_conflict",
+                            "work-claim review state has changed",
+                        )
                 self.db._audit(
                     conn,
                     actor["id"],
-                    "work_claim.status_changed",
+                    audit_action,
                     claim_id,
                     {
                         "project_id": project["id"],
                         "kind": kind,
-                        "from_status": claim["status"],
+                        "from_status": current_status,
                         "to_status": status,
                     },
                 )
-                updated = self._work_claim_row(
-                    conn, project["id"], kind, claim_id
-                )
+                updated = self._work_claim_row(conn, project["id"], kind, claim_id)
                 return 200, self._serialize_work_claim(updated, project_key)
 
             result = self._idempotent(
@@ -1202,10 +1534,19 @@ class Service:
     ) -> sqlite3.Row:
         row = conn.execute(
             """
-            SELECT p.id, p.project_key, pm.role
+            SELECT
+                p.id,
+                p.project_key,
+                CASE
+                    WHEN pm.role = 'admin' THEN 'admin'
+                    WHEN pc.user_id IS NOT NULL THEN 'coordinator'
+                    ELSE 'member'
+                END AS role
             FROM projects p
             JOIN project_members pm ON pm.project_id = p.id
             JOIN users u ON u.id = pm.user_id
+            LEFT JOIN project_coordinators pc
+              ON pc.project_id = pm.project_id AND pc.user_id = pm.user_id
             WHERE p.project_key = ? AND pm.user_id = ? AND u.active = 1
             """,
             (project_key, user_id),
@@ -1213,6 +1554,15 @@ class Service:
         if row is None:
             raise ServiceError(404, "scope_not_found", "project scope not found")
         return row
+
+    @staticmethod
+    def _require_coordinator(project: sqlite3.Row) -> None:
+        if project["role"] not in COORDINATION_ROLES:
+            raise ServiceError(
+                403,
+                "forbidden",
+                "project coordinator or admin role required",
+            )
 
     def _session_membership(
         self, conn: sqlite3.Connection, user_id: str, project_id: str, session_id: str
@@ -1239,9 +1589,17 @@ class Service:
             """
             SELECT
                 wc.*,
+                CASE
+                    WHEN review.claim_id IS NOT NULL THEN 'under_review'
+                    ELSE wc.status
+                END AS effective_status,
+                review.submitted_by AS review_submitted_by,
+                review.submitted_at AS review_submitted_at,
                 creator.handle AS creator_handle,
                 assignee.handle AS assignee_handle
             FROM work_claims wc
+            LEFT JOIN work_claim_review_requests review
+              ON review.project_id = wc.project_id AND review.claim_id = wc.id
             JOIN users creator ON creator.id = wc.created_by
             LEFT JOIN users assignee ON assignee.id = wc.assignee_id
             WHERE wc.project_id = ? AND wc.kind = ? AND wc.id = ?
@@ -1401,9 +1759,7 @@ class Service:
         return MutationResult(status_code, response)
 
     @staticmethod
-    def _serialize_work_claim(
-        row: sqlite3.Row, project_key: str
-    ) -> dict[str, Any]:
+    def _serialize_work_claim(row: sqlite3.Row, project_key: str) -> dict[str, Any]:
         assignee = None
         if row["assignee_id"] is not None:
             assignee = {
@@ -1416,7 +1772,7 @@ class Service:
                 "project_key": project_key,
                 "kind": row["kind"],
                 "external_id": row["external_id"],
-                "status": row["status"],
+                "status": row["effective_status"],
                 "version": row["version"],
                 "assignee": assignee,
                 "created_by": {
@@ -1544,10 +1900,22 @@ class Service:
         except ValidationError as exc:
             raise self._validation_error(exc) from exc
 
+    def _valid_handle(self, value: object) -> str:
+        try:
+            return validate_handle(value)
+        except ValidationError as exc:
+            raise self._validation_error(exc) from exc
+
     @staticmethod
     def _valid_work_kind(value: object) -> str:
         if not isinstance(value, str) or value not in WORK_KINDS:
             raise ServiceError(400, "invalid_kind", "unknown work-claim kind")
+        return value
+
+    @staticmethod
+    def _valid_work_status(value: object) -> str:
+        if not isinstance(value, str) or value not in WORK_STATUSES:
+            raise ServiceError(400, "invalid_status", "unknown work-claim status")
         return value
 
     @staticmethod
