@@ -1,0 +1,91 @@
+name: imitation-krab
+
+x-krab-runtime: &krab-runtime
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: imitation-krab:local
+  pull_policy: never
+  user: "10001:10001"
+  read_only: true
+  init: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 64
+  mem_limit: 256m
+  cpus: 1.0
+  environment:
+    KRAB_DB: /var/lib/imitation-krab/data/krab.db
+    KRAB_PEPPER_FILE: /var/lib/imitation-krab/secrets/pepper.key
+    PYTHONDONTWRITEBYTECODE: "1"
+    PYTHONUNBUFFERED: "1"
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1700,uid=10001,gid=10001
+  logging:
+    driver: json-file
+    options:
+      max-size: 1m
+      max-file: "3"
+
+services:
+  krab:
+    <<: *krab-runtime
+    command:
+      - serve
+      - --container-bind
+      - --port
+      - "8765"
+    restart: unless-stopped
+    stop_grace_period: 15s
+    ports:
+      - name: api
+        target: 8765
+        published: "8765"
+        host_ip: 127.0.0.1
+        protocol: tcp
+        app_protocol: http
+    volumes:
+      - type: volume
+        source: krab_data
+        target: /var/lib/imitation-krab/data
+      - type: volume
+        source: krab_pepper
+        target: /var/lib/imitation-krab/secrets
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import json, urllib.request;
+          response = urllib.request.urlopen('http://127.0.0.1:8765/v1/health', timeout=2);
+          raise SystemExit(0 if response.status == 200 and json.load(response) == {'status': 'ok'} else 1)
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  krab-admin:
+    <<: *krab-runtime
+    profiles:
+      - admin
+    network_mode: none
+    command:
+      - --help
+    volumes:
+      - type: volume
+        source: krab_data
+        target: /var/lib/imitation-krab/data
+      - type: volume
+        source: krab_pepper
+        target: /var/lib/imitation-krab/secrets
+      - type: volume
+        source: krab_backups
+        target: /var/lib/imitation-krab/backups
+
+volumes:
+  krab_data:
+  krab_pepper:
+  krab_backups:
