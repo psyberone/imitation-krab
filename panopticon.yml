@@ -15,8 +15,9 @@ groups:
     - src/imitation_krab/sanitize.py
     - src/imitation_krab/__init__.py
     - src/imitation_krab/__main__.py
+    - schemas/**
     tests:
-    - tests/test_sanitize.py
+    - tests/test_*.py
     panels:
     - ARC
     - DAT

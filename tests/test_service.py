@@ -268,15 +268,20 @@ class ServiceTests(ServiceFixture):
         )
         self.assertEqual(submitted.payload["trusted_metadata"]["version"], 4)
 
-        done = self.service.change_work_status(
+        done = self.service.review_work(
             self.alice,
             "project-one",
             "issue",
             claim_id,
-            {"status": "done", "expected_version": 4},
+            {
+                "action": "approved",
+                "expected_version": 4,
+                "session_id": self.session_id,
+                "body": "Approved.",
+            },
             "finish-claim-0001",
         )
-        self.assertEqual(done.payload["trusted_metadata"]["status"], "done")
+        self.assertEqual(done.payload["claim"]["trusted_metadata"]["status"], "done")
 
         with self.assertRaises(ServiceError) as caught:
             self.service.release_work(
@@ -297,6 +302,15 @@ class ServiceTests(ServiceFixture):
         coordinator = self.db.authenticate(coordinator_token)
         carol = self.db.authenticate(carol_token)
         assert coordinator and carol
+        review_session = self.service.create_session(
+            self.alice,
+            "project-one",
+            {
+                "label": "Coordinator review",
+                "participants": ["primary-dev", "bob"],
+            },
+            "coordinator-review-session-0001",
+        ).payload["trusted_metadata"]["session_id"]
 
         claim_id = self.create_claim(
             external_id="owner/repository#review",
@@ -376,24 +390,36 @@ class ServiceTests(ServiceFixture):
             )
         self.assertEqual(caught.exception.code, "forbidden")
 
-        approved = self.service.change_work_status(
+        approved = self.service.review_work(
             coordinator,
             "project-one",
             "issue",
             claim_id,
-            {"status": "done", "expected_version": 4},
+            {
+                "action": "approved",
+                "expected_version": 4,
+                "session_id": review_session,
+                "body": "Approved.",
+            },
             "approve-review-work-0001",
         )
-        replay = self.service.change_work_status(
+        replay = self.service.review_work(
             coordinator,
             "project-one",
             "issue",
             claim_id,
-            {"status": "done", "expected_version": 4},
+            {
+                "action": "approved",
+                "expected_version": 4,
+                "session_id": review_session,
+                "body": "Approved.",
+            },
             "approve-review-work-0001",
         )
-        self.assertEqual(approved.payload["trusted_metadata"]["status"], "done")
-        self.assertEqual(approved.payload["trusted_metadata"]["version"], 5)
+        self.assertEqual(
+            approved.payload["claim"]["trusted_metadata"]["status"], "done"
+        )
+        self.assertEqual(approved.payload["claim"]["trusted_metadata"]["version"], 5)
         self.assertTrue(replay.replayed)
         self.assertEqual(replay.payload, approved.payload)
 
@@ -419,6 +445,15 @@ class ServiceTests(ServiceFixture):
         self.db.add_project_member("project-one", "primary-dev", "coordinator")
         coordinator = self.db.authenticate(coordinator_token)
         assert coordinator
+        review_session = self.service.create_session(
+            self.alice,
+            "project-one",
+            {
+                "label": "Changes review",
+                "participants": ["primary-dev", "bob"],
+            },
+            "changes-review-session-0001",
+        ).payload["trusted_metadata"]["session_id"]
         claim_id = self.create_claim(
             external_id="owner/repository#changes",
             key="create-changes-claim-0001",
@@ -448,16 +483,23 @@ class ServiceTests(ServiceFixture):
             "submit-changes-work-0001",
         )
 
-        returned = self.service.change_work_status(
+        returned = self.service.review_work(
             coordinator,
             "project-one",
             "issue",
             claim_id,
-            {"status": "active", "expected_version": 4},
+            {
+                "action": "changes_requested",
+                "expected_version": 4,
+                "session_id": review_session,
+                "body": "Please revise.",
+            },
             "return-changes-work-0001",
         )
-        self.assertEqual(returned.payload["trusted_metadata"]["status"], "active")
-        self.assertEqual(returned.payload["trusted_metadata"]["version"], 5)
+        self.assertEqual(
+            returned.payload["claim"]["trusted_metadata"]["status"], "active"
+        )
+        self.assertEqual(returned.payload["claim"]["trusted_metadata"]["version"], 5)
 
         submitted_again = self.service.change_work_status(
             self.bob,
@@ -511,6 +553,15 @@ class ServiceTests(ServiceFixture):
         self.db.add_project_member("project-one", "primary-dev", "coordinator")
         coordinator = self.db.authenticate(coordinator_token)
         assert coordinator
+        review_session = self.service.create_session(
+            self.alice,
+            "project-one",
+            {
+                "label": "Admin review",
+                "participants": ["primary-dev"],
+            },
+            "admin-review-session-0001",
+        ).payload["trusted_metadata"]["session_id"]
         claim_id = self.create_claim(
             external_id="owner/repository#coordinator-review",
             key="create-coordinator-review-0001",
@@ -551,15 +602,22 @@ class ServiceTests(ServiceFixture):
             )
         self.assertEqual(caught.exception.code, "self_approval")
 
-        approved = self.service.change_work_status(
+        approved = self.service.review_work(
             self.alice,
             "project-one",
             "issue",
             claim_id,
-            {"status": "done", "expected_version": 4},
+            {
+                "action": "approved",
+                "expected_version": 4,
+                "session_id": review_session,
+                "body": "Approved.",
+            },
             "admin-approve-coordinator-0001",
         )
-        self.assertEqual(approved.payload["trusted_metadata"]["status"], "done")
+        self.assertEqual(
+            approved.payload["claim"]["trusted_metadata"]["status"], "done"
+        )
 
     def test_review_queue_filters_are_exact_composable_and_scoped(self) -> None:
         _, carol_token = self.db.create_user("carol")
@@ -676,6 +734,15 @@ class ServiceTests(ServiceFixture):
         self.db.add_project_member("project-one", "primary-dev", "coordinator")
         coordinator = self.db.authenticate(coordinator_token)
         assert coordinator
+        review_session = self.service.create_session(
+            self.alice,
+            "project-one",
+            {
+                "label": "Review race",
+                "participants": ["primary-dev", "bob"],
+            },
+            "review-race-session-0001",
+        ).payload["trusted_metadata"]["session_id"]
         claim_id = self.create_claim(
             external_id="owner/repository#review-race",
             key="create-review-race-0001",
@@ -706,18 +773,23 @@ class ServiceTests(ServiceFixture):
         )
         barrier = threading.Barrier(2)
 
-        def verdict(actor: dict, status: str, key: str) -> tuple[str, str]:
+        def verdict(actor: dict, action: str, key: str) -> tuple[str, str]:
             barrier.wait(timeout=2)
             try:
-                result = self.service.change_work_status(
+                result = self.service.review_work(
                     actor,
                     "project-one",
                     "issue",
                     claim_id,
-                    {"status": status, "expected_version": 4},
+                    {
+                        "action": action,
+                        "expected_version": 4,
+                        "session_id": review_session,
+                        "body": "Race verdict.",
+                    },
                     key,
                 )
-                return "won", result.payload["trusted_metadata"]["status"]
+                return "won", result.payload["claim"]["trusted_metadata"]["status"]
             except ServiceError as exc:
                 return "lost", exc.code
 
@@ -726,8 +798,12 @@ class ServiceTests(ServiceFixture):
                 pool.map(
                     lambda args: verdict(*args),
                     (
-                        (self.alice, "done", "review-race-approve-0001"),
-                        (coordinator, "active", "review-race-return-0001"),
+                        (self.alice, "approved", "review-race-approve-0001"),
+                        (
+                            coordinator,
+                            "changes_requested",
+                            "review-race-return-0001",
+                        ),
                     ),
                 )
             )
@@ -741,6 +817,13 @@ class ServiceTests(ServiceFixture):
             next(value for outcome, value in results if outcome == "lost"),
             "version_conflict",
         )
+        with closing(self.db.connect()) as conn:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM items WHERE work_claim_id = ?", (claim_id,)
+                ).fetchone()[0],
+                1,
+            )
 
     def test_claim_release_is_limited_to_assignee_or_coordination_role(self) -> None:
         _, carol_token = self.db.create_user("carol")
@@ -1317,8 +1400,7 @@ class DatabaseMigrationTests(unittest.TestCase):
             root = Path(directory)
             database_path = root / "legacy.db"
             with closing(sqlite3.connect(database_path)) as conn:
-                conn.executescript(
-                    """
+                conn.executescript("""
                     CREATE TABLE schema_meta (version INTEGER NOT NULL);
                     INSERT INTO schema_meta(version) VALUES (1);
                     CREATE TABLE users (id TEXT PRIMARY KEY);
@@ -1335,8 +1417,7 @@ class DatabaseMigrationTests(unittest.TestCase):
                     INSERT INTO projects(id) VALUES ('prj_legacy');
                     INSERT INTO items(id, project_id)
                     VALUES ('itm_legacy', 'prj_legacy');
-                    """
-                )
+                    """)
                 conn.commit()
             database_path.chmod(0o600)
 
@@ -1345,7 +1426,7 @@ class DatabaseMigrationTests(unittest.TestCase):
             conn = database.connect()
             try:
                 self.assertEqual(
-                    conn.execute("SELECT version FROM schema_meta").fetchone()[0], 4
+                    conn.execute("SELECT version FROM schema_meta").fetchone()[0], 5
                 )
                 columns = {
                     row[1]
@@ -1381,8 +1462,7 @@ class DatabaseMigrationTests(unittest.TestCase):
             root = Path(directory)
             database_path = root / "legacy-v2.db"
             with closing(sqlite3.connect(database_path)) as conn:
-                conn.executescript(
-                    """
+                conn.executescript("""
                     CREATE TABLE schema_meta (version INTEGER NOT NULL);
                     INSERT INTO schema_meta(version) VALUES (2);
                     CREATE TABLE project_members (
@@ -1394,8 +1474,20 @@ class DatabaseMigrationTests(unittest.TestCase):
                     );
                     INSERT INTO project_members(project_id, user_id, role, created_at)
                     VALUES ('prj_legacy', 'usr_legacy', 'admin', '2026-01-01T00:00:00Z');
-                    """
-                )
+                    CREATE TABLE work_claims (
+                        id TEXT PRIMARY KEY,
+                        project_id TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        external_id TEXT NOT NULL,
+                        assignee_id TEXT,
+                        status TEXT NOT NULL,
+                        version INTEGER NOT NULL,
+                        created_by TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        UNIQUE (project_id, id)
+                    );
+                    """)
                 conn.commit()
             database_path.chmod(0o600)
 
@@ -1404,7 +1496,7 @@ class DatabaseMigrationTests(unittest.TestCase):
             conn = database.connect()
             try:
                 self.assertEqual(
-                    conn.execute("SELECT version FROM schema_meta").fetchone()[0], 4
+                    conn.execute("SELECT version FROM schema_meta").fetchone()[0], 5
                 )
                 member = conn.execute(
                     "SELECT role FROM project_members WHERE project_id = 'prj_legacy'"
@@ -1430,8 +1522,7 @@ class DatabaseMigrationTests(unittest.TestCase):
             root = Path(directory)
             database_path = root / "legacy-v3.db"
             with closing(sqlite3.connect(database_path)) as conn:
-                conn.executescript(
-                    """
+                conn.executescript("""
                     PRAGMA foreign_keys = ON;
                     CREATE TABLE schema_meta (version INTEGER NOT NULL);
                     INSERT INTO schema_meta(version) VALUES (3);
@@ -1471,8 +1562,7 @@ class DatabaseMigrationTests(unittest.TestCase):
                         'usr_worker', 'active', 3, 'usr_worker',
                         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'
                     );
-                    """
-                )
+                    """)
                 conn.commit()
             database_path.chmod(0o600)
 
@@ -1481,7 +1571,7 @@ class DatabaseMigrationTests(unittest.TestCase):
             conn = database.connect()
             try:
                 self.assertEqual(
-                    conn.execute("SELECT version FROM schema_meta").fetchone()[0], 4
+                    conn.execute("SELECT version FROM schema_meta").fetchone()[0], 5
                 )
                 claim = conn.execute(
                     "SELECT status, version, assignee_id FROM work_claims "

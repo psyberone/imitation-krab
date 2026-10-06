@@ -73,11 +73,18 @@ COORDINATION_ROLES = {"coordinator", "admin"}
 
 
 class ServiceError(RuntimeError):
-    def __init__(self, status: int, code: str, message: str):
+    def __init__(
+        self,
+        status: int,
+        code: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ):
         super().__init__(message)
         self.status = status
         self.code = code
         self.message = message
+        self.details = details
 
 
 @dataclass(frozen=True)
@@ -468,8 +475,15 @@ class Service:
                     ),
                 )
                 if cursor.rowcount != 1:
+                    current = self._work_claim_row(conn, project["id"], kind, claim_id)
                     raise ServiceError(
-                        409, "version_conflict", "work-claim version has changed"
+                        409,
+                        "version_conflict",
+                        "work-claim version has changed",
+                        {
+                            "expected_version": version,
+                            "current_version": current["version"],
+                        },
                     )
                 self.db._audit(
                     conn,
@@ -560,8 +574,15 @@ class Service:
                     ),
                 )
                 if cursor.rowcount != 1:
+                    current = self._work_claim_row(conn, project["id"], kind, claim_id)
                     raise ServiceError(
-                        409, "version_conflict", "work-claim version has changed"
+                        409,
+                        "version_conflict",
+                        "work-claim version has changed",
+                        {
+                            "expected_version": version,
+                            "current_version": current["version"],
+                        },
                     )
                 self.db._audit(
                     conn,
@@ -644,8 +665,15 @@ class Service:
                     (now, claim_id, project["id"], kind, version),
                 )
                 if cursor.rowcount != 1:
+                    current = self._work_claim_row(conn, project["id"], kind, claim_id)
                     raise ServiceError(
-                        409, "version_conflict", "work-claim version has changed"
+                        409,
+                        "version_conflict",
+                        "work-claim version has changed",
+                        {
+                            "expected_version": version,
+                            "current_version": current["version"],
+                        },
                     )
                 review_cleared = effective_status == "under_review"
                 if review_cleared:
@@ -659,6 +687,10 @@ class Service:
                             409,
                             "version_conflict",
                             "work-claim review state has changed",
+                            {
+                                "expected_version": version,
+                                "current_version": claim["version"],
+                            },
                         )
                 self.db._audit(
                     conn,
@@ -747,18 +779,29 @@ class Service:
                                 403,
                                 "self_approval",
                                 "an assignee cannot approve their own work",
+                                {
+                                    "required_roles": ["coordinator", "admin"],
+                                    "assignee_may_act": False,
+                                },
                             )
                         raise ServiceError(
                             403,
                             "forbidden",
                             "an assignee cannot review their own work",
+                            {
+                                "required_roles": ["coordinator", "admin"],
+                                "assignee_may_act": False,
+                            },
                         )
                     self._require_coordinator(project)
-                    stored_status = status
-                    audit_action = (
-                        "work_claim.approved"
-                        if status == "done"
-                        else "work_claim.changes_requested"
+                    raise ServiceError(
+                        409,
+                        "review_verdict_required",
+                        "review verdicts require the atomic claim-review operation",
+                        {
+                            "operation": "claim-review",
+                            "allowed_actions": ["changes_requested", "approved"],
+                        },
                     )
                 else:
                     raise ServiceError(
@@ -770,12 +813,14 @@ class Service:
                 cursor = conn.execute(
                     """
                     UPDATE work_claims
-                    SET status = ?, version = version + 1, updated_at = ?
+                    SET status = ?, version = version + 1,
+                        review_round = review_round + ?, updated_at = ?
                     WHERE id = ? AND project_id = ? AND kind = ? AND version = ?
                       AND status = ?
                     """,
                     (
                         stored_status,
+                        1 if status == "under_review" else 0,
                         now,
                         claim_id,
                         project["id"],
@@ -785,8 +830,15 @@ class Service:
                     ),
                 )
                 if cursor.rowcount != 1:
+                    current = self._work_claim_row(conn, project["id"], kind, claim_id)
                     raise ServiceError(
-                        409, "version_conflict", "work-claim version has changed"
+                        409,
+                        "version_conflict",
+                        "work-claim version has changed",
+                        {
+                            "expected_version": version,
+                            "current_version": current["version"],
+                        },
                     )
 
                 if current_status == "active" and status == "under_review":
@@ -798,18 +850,6 @@ class Service:
                         """,
                         (project["id"], claim_id, actor["id"], now),
                     )
-                elif current_status == "under_review":
-                    deleted = conn.execute(
-                        "DELETE FROM work_claim_review_requests "
-                        "WHERE project_id = ? AND claim_id = ?",
-                        (project["id"], claim_id),
-                    )
-                    if deleted.rowcount != 1:
-                        raise ServiceError(
-                            409,
-                            "version_conflict",
-                            "work-claim review state has changed",
-                        )
                 self.db._audit(
                     conn,
                     actor["id"],
@@ -820,6 +860,11 @@ class Service:
                         "kind": kind,
                         "from_status": current_status,
                         "to_status": status,
+                        "review_round": (
+                            claim["review_round"] + 1
+                            if status == "under_review"
+                            else claim["review_round"]
+                        ),
                     },
                 )
                 updated = self._work_claim_row(conn, project["id"], kind, claim_id)
@@ -835,6 +880,242 @@ class Service:
             raise
         finally:
             conn.close()
+
+    def review_work(
+        self,
+        actor: dict[str, Any],
+        project_key: str,
+        kind: str,
+        claim_id: str,
+        payload: dict[str, Any],
+        idempotency_key: str,
+    ) -> MutationResult:
+        project_key = self._valid_project_key(project_key)
+        kind = self._valid_work_kind(kind)
+        claim_id = self._valid_object_id(claim_id, "clm")
+        self._require_fields(
+            payload,
+            required={"action", "expected_version", "session_id", "body"},
+        )
+        action = payload["action"]
+        if action not in {"changes_requested", "approved"}:
+            raise ServiceError(
+                400,
+                "invalid_review_action",
+                "action must be changes_requested or approved",
+            )
+        version = self._valid_expected_version(payload["expected_version"])
+        session_id = self._valid_object_id(payload["session_id"], "ses")
+        body = self._sanitized_text(
+            payload["body"], field="body", max_bytes=MAX_BODY_BYTES
+        )
+        key = self._valid_idempotency_key(idempotency_key)
+        canonical = {
+            "action": action,
+            "expected_version": version,
+            "session_id": session_id,
+            "body": body.text,
+        }
+        operation = f"work_claim.review:{project_key}:{kind}:{claim_id}"
+        conn = self.db.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+
+            def mutate() -> tuple[int, dict[str, Any]]:
+                project = self._project_membership(conn, actor["id"], project_key)
+                claim = self._work_claim_row(conn, project["id"], kind, claim_id)
+                self._require_claim_version(claim, version)
+                if claim["effective_status"] != "under_review":
+                    raise ServiceError(
+                        409,
+                        "invalid_transition",
+                        "a verdict requires work currently under review",
+                    )
+                if claim["assignee_id"] == actor["id"]:
+                    raise ServiceError(
+                        403,
+                        "self_approval",
+                        "an assignee cannot review their own work",
+                        {
+                            "required_roles": ["coordinator", "admin"],
+                            "assignee_may_act": False,
+                        },
+                    )
+                self._require_coordinator(project)
+
+                title_action = (
+                    "Changes requested" if action == "changes_requested" else "Approved"
+                )
+                title = self._sanitized_text(
+                    f"{title_action} (review round {claim['review_round']}): "
+                    f"{claim['external_id']}",
+                    field="title",
+                    max_bytes=MAX_TITLE_BYTES,
+                )
+                flags = merge_risk_flags(title.risk_flags, body.risk_flags)
+                notification = self._create_item_in_transaction(
+                    conn,
+                    project_id=project["id"],
+                    session_id=session_id,
+                    actor_id=actor["id"],
+                    recipient_handle=claim["assignee_handle"],
+                    claim_id=claim_id,
+                    title=title.text,
+                    body=body.text,
+                    flags=flags,
+                )
+
+                target_status = "active" if action == "changes_requested" else "done"
+                now = self.db.now()
+                cursor = conn.execute(
+                    """
+                    UPDATE work_claims
+                    SET status = ?, version = version + 1, updated_at = ?
+                    WHERE id = ? AND project_id = ? AND kind = ? AND version = ?
+                      AND status = 'active'
+                    """,
+                    (
+                        target_status,
+                        now,
+                        claim_id,
+                        project["id"],
+                        kind,
+                        version,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    current = self._work_claim_row(conn, project["id"], kind, claim_id)
+                    raise ServiceError(
+                        409,
+                        "version_conflict",
+                        "work-claim version has changed",
+                        {
+                            "expected_version": version,
+                            "current_version": current["version"],
+                        },
+                    )
+                deleted = conn.execute(
+                    "DELETE FROM work_claim_review_requests "
+                    "WHERE project_id = ? AND claim_id = ?",
+                    (project["id"], claim_id),
+                )
+                if deleted.rowcount != 1:
+                    raise ServiceError(
+                        409,
+                        "version_conflict",
+                        "work-claim review state has changed",
+                        {
+                            "expected_version": version,
+                            "current_version": version + 1,
+                        },
+                    )
+                notification_meta = notification["trusted_metadata"]
+                self.db._audit(
+                    conn,
+                    actor["id"],
+                    f"work_claim.{action}",
+                    claim_id,
+                    {
+                        "project_id": project["id"],
+                        "kind": kind,
+                        "from_status": "under_review",
+                        "to_status": target_status,
+                        "review_round": claim["review_round"],
+                        "notification_item_id": notification_meta["item_id"],
+                        "notification_event_seq": notification_meta["event_seq"],
+                    },
+                )
+                updated = self._work_claim_row(conn, project["id"], kind, claim_id)
+                return 200, {
+                    "trusted_metadata": {
+                        "action": action,
+                        "review_round": claim["review_round"],
+                        "notification_item_id": notification_meta["item_id"],
+                        "notification_event_seq": notification_meta["event_seq"],
+                    },
+                    "claim": self._serialize_work_claim(updated, project_key),
+                    "notification": notification,
+                }
+
+            result = self._idempotent(
+                conn, actor["id"], key, operation, canonical, mutate
+            )
+            conn.commit()
+            return result
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def get_work_claim(
+        self,
+        actor: dict[str, Any],
+        project_key: str,
+        kind: str,
+        claim_id: str,
+    ) -> dict[str, Any]:
+        project_key = self._valid_project_key(project_key)
+        kind = self._valid_work_kind(kind)
+        claim_id = self._valid_object_id(claim_id, "clm")
+        conn = self.db.connect()
+        try:
+            project = self._project_membership(conn, actor["id"], project_key)
+            claim = self._work_claim_row(conn, project["id"], kind, claim_id)
+            rows = conn.execute(
+                """
+                SELECT a.action, a.details_json, a.created_at,
+                       u.id AS actor_id, u.handle AS actor_handle
+                FROM audit_log a
+                JOIN users u ON u.id = a.actor_user_id
+                WHERE a.target = ? AND a.action IN (
+                    'work_claim.submitted',
+                    'work_claim.changes_requested',
+                    'work_claim.approved'
+                )
+                ORDER BY a.seq
+                """,
+                (claim_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        history: list[dict[str, Any]] = []
+        derived_round = 0
+        for row in rows:
+            details = json.loads(row["details_json"])
+            if details.get("project_id") != project["id"]:
+                continue
+            stored_round = details.get("review_round")
+            if row["action"] == "work_claim.submitted":
+                if isinstance(stored_round, int) and stored_round > derived_round:
+                    derived_round = stored_round
+                else:
+                    derived_round += 1
+            review_round = (
+                stored_round
+                if isinstance(stored_round, int) and stored_round > 0
+                else derived_round
+            )
+            entry = {
+                "action": row["action"].removeprefix("work_claim."),
+                "actor": {
+                    "user_id": row["actor_id"],
+                    "handle": row["actor_handle"],
+                },
+                "from_status": details.get("from_status"),
+                "to_status": details.get("to_status"),
+                "review_round": review_round,
+                "created_at": row["created_at"],
+            }
+            if "notification_item_id" in details:
+                entry["notification_item_id"] = details["notification_item_id"]
+                entry["notification_event_seq"] = details["notification_event_seq"]
+            history.append({"trusted_metadata": entry})
+        return {
+            "claim": self._serialize_work_claim(claim, project_key),
+            "review_history": history,
+        }
 
     def create_session(
         self,
@@ -1111,103 +1392,17 @@ class Service:
 
             def mutate() -> tuple[int, dict[str, Any]]:
                 project = self._project_membership(conn, actor["id"], project_key)
-                self._session_membership(conn, actor["id"], project["id"], session_id)
-                if claim_id is not None:
-                    linked_claim = conn.execute(
-                        """
-                        SELECT 1 FROM work_claims
-                        WHERE id = ? AND project_id = ?
-                        """,
-                        (claim_id, project["id"]),
-                    ).fetchone()
-                    if linked_claim is None:
-                        raise ServiceError(
-                            404,
-                            "work_claim_not_found",
-                            "work claim not found in this project",
-                        )
-                session = conn.execute(
-                    "SELECT state FROM sessions WHERE id = ? AND project_id = ?",
-                    (session_id, project["id"]),
-                ).fetchone()
-                if session["state"] != "active":
-                    raise ServiceError(
-                        409, "session_closed", "session does not accept new work"
-                    )
-                recipient = conn.execute(
-                    """
-                    SELECT u.id, u.handle
-                    FROM users u
-                    JOIN session_members sm ON sm.user_id = u.id
-                    WHERE u.handle = ? AND u.active = 1
-                      AND sm.project_id = ? AND sm.session_id = ?
-                    """,
-                    (recipient_handle, project["id"], session_id),
-                ).fetchone()
-                if recipient is None:
-                    raise ServiceError(
-                        404,
-                        "recipient_not_found",
-                        "recipient is not an active session participant",
-                    )
-                if recipient["id"] == actor["id"]:
-                    raise ServiceError(
-                        400, "self_assignment", "recipient must be another user"
-                    )
-                open_count = conn.execute(
-                    """
-                    SELECT COUNT(*) AS count FROM items
-                    WHERE project_id = ? AND session_id = ?
-                      AND creator_id = ? AND recipient_id = ? AND status LIKE 'open.%'
-                    """,
-                    (project["id"], session_id, actor["id"], recipient["id"]),
-                ).fetchone()["count"]
-                if open_count >= MAX_OPEN_ITEMS_PER_ROUTE:
-                    raise ServiceError(
-                        429, "queue_limit", "too many open items for this recipient"
-                    )
-
-                item_id = self.db.new_id("itm")
-                now = self.db.now()
-                conn.execute(
-                    """
-                    INSERT INTO items(
-                        id, project_id, session_id, creator_id, recipient_id, work_claim_id,
-                        title, body, risk_flags, status, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open.pending', ?, ?)
-                    """,
-                    (
-                        item_id,
-                        project["id"],
-                        session_id,
-                        actor["id"],
-                        recipient["id"],
-                        claim_id,
-                        title.text,
-                        body.text,
-                        self._json_list(flags),
-                        now,
-                        now,
-                    ),
-                )
-                event_seq = self._insert_event(
+                response = self._create_item_in_transaction(
                     conn,
-                    project["id"],
-                    session_id,
-                    item_id,
-                    actor["id"],
-                    "item.created",
-                    None,
-                    "open.pending",
-                    None,
-                    flags,
-                    recipient["id"],
+                    project_id=project["id"],
+                    session_id=session_id,
+                    actor_id=actor["id"],
+                    recipient_handle=recipient_handle,
+                    claim_id=claim_id,
+                    title=title.text,
+                    body=body.text,
+                    flags=flags,
                 )
-                row = self._item_row(
-                    conn, project["id"], session_id, item_id, actor["id"]
-                )
-                response = self._serialize_item(row)
-                response["trusted_metadata"]["event_seq"] = event_seq
                 return 201, response
 
             result = self._idempotent(
@@ -1295,7 +1490,13 @@ class Service:
                 )
                 if item["version"] != version:
                     raise ServiceError(
-                        409, "version_conflict", "work item version has changed"
+                        409,
+                        "version_conflict",
+                        "work item version has changed",
+                        {
+                            "expected_version": version,
+                            "current_version": item["version"],
+                        },
                     )
                 transition = (item["status"], status)
                 if actor["id"] == item["recipient_id"]:
@@ -1325,8 +1526,17 @@ class Service:
                     (status, now, item_id, version),
                 )
                 if cursor.rowcount != 1:
+                    current = self._item_row(
+                        conn, project["id"], session_id, item_id, actor["id"]
+                    )
                     raise ServiceError(
-                        409, "version_conflict", "work item version has changed"
+                        409,
+                        "version_conflict",
+                        "work item version has changed",
+                        {
+                            "expected_version": version,
+                            "current_version": current["version"],
+                        },
                     )
                 event_seq = self._insert_event(
                     conn,
@@ -1529,6 +1739,209 @@ class Service:
             "events": events,
         }
 
+    def get_project_inbox(
+        self,
+        actor: dict[str, Any],
+        project_key: str,
+        *,
+        after: int | None = 0,
+        limit: int = 50,
+        wait: int = 0,
+        unread: bool = False,
+    ) -> dict[str, Any]:
+        project_key = self._valid_project_key(project_key)
+        if not isinstance(unread, bool):
+            raise ServiceError(400, "invalid_unread", "unread must be a boolean")
+        if unread and after is not None:
+            raise ServiceError(
+                400,
+                "invalid_cursor",
+                "after and unread cannot be used together",
+            )
+        if after is None:
+            after = 0
+        if isinstance(after, bool) or not isinstance(after, int) or after < 0:
+            raise ServiceError(
+                400, "invalid_cursor", "after must be a non-negative integer"
+            )
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= MAX_QUEUE_LIMIT
+        ):
+            raise ServiceError(
+                400, "invalid_limit", f"limit must be between 1 and {MAX_QUEUE_LIMIT}"
+            )
+        if (
+            isinstance(wait, bool)
+            or not isinstance(wait, int)
+            or not 0 <= wait <= MAX_LONG_POLL_SECONDS
+        ):
+            raise ServiceError(
+                400,
+                "invalid_wait",
+                f"wait must be between 0 and {MAX_LONG_POLL_SECONDS}",
+            )
+
+        deadline = time.monotonic() + wait
+        rows: list[sqlite3.Row] = []
+        effective_after = after
+        acked_through = 0
+        while True:
+            conn = self.db.connect()
+            try:
+                project = self._project_membership(conn, actor["id"], project_key)
+                cursor = conn.execute(
+                    """
+                    SELECT acked_through FROM project_inbox_cursors
+                    WHERE project_id = ? AND user_id = ?
+                    """,
+                    (project["id"], actor["id"]),
+                ).fetchone()
+                acked_through = cursor["acked_through"] if cursor is not None else 0
+                effective_after = acked_through if unread else after
+                rows = conn.execute(
+                    """
+                    SELECT
+                        e.*, i.title, i.body, i.status AS current_status, i.version,
+                        i.work_claim_id,
+                        wc.kind AS work_claim_kind,
+                        wc.external_id AS work_claim_external_id,
+                        creator.id AS creator_id, creator.handle AS creator_handle,
+                        recipient.id AS recipient_id,
+                        recipient.handle AS recipient_handle,
+                        event_actor.handle AS actor_handle
+                    FROM deliveries d
+                    JOIN events e ON e.seq = d.event_seq
+                    JOIN items i ON i.id = e.item_id
+                    JOIN users creator ON creator.id = i.creator_id
+                    JOIN users recipient ON recipient.id = i.recipient_id
+                    JOIN users event_actor ON event_actor.id = e.actor_id
+                    JOIN session_members reader_scope
+                      ON reader_scope.project_id = e.project_id
+                     AND reader_scope.session_id = e.session_id
+                     AND reader_scope.user_id = d.user_id
+                    LEFT JOIN work_claims wc ON wc.id = i.work_claim_id
+                    WHERE d.user_id = ? AND e.project_id = ? AND e.seq > ?
+                    ORDER BY e.seq
+                    LIMIT ?
+                    """,
+                    (
+                        actor["id"],
+                        project["id"],
+                        effective_after,
+                        limit,
+                    ),
+                ).fetchall()
+            finally:
+                conn.close()
+            if rows or time.monotonic() >= deadline:
+                break
+            time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+
+        return {
+            "trusted_metadata": {
+                "project_key": project_key,
+                "after": effective_after,
+                "next_cursor": rows[-1]["seq"] if rows else effective_after,
+                "acked_through": acked_through,
+                "unread": unread,
+            },
+            "events": [self._serialize_queue_event(row, project_key) for row in rows],
+        }
+
+    def ack_project_inbox(
+        self,
+        actor: dict[str, Any],
+        project_key: str,
+        payload: dict[str, Any],
+        idempotency_key: str,
+    ) -> MutationResult:
+        project_key = self._valid_project_key(project_key)
+        self._require_fields(payload, required={"through"})
+        through = payload["through"]
+        if isinstance(through, bool) or not isinstance(through, int) or through < 0:
+            raise ServiceError(
+                400, "invalid_cursor", "through must be a non-negative integer"
+            )
+        key = self._valid_idempotency_key(idempotency_key)
+        canonical = {"through": through}
+        operation = f"project_inbox.ack:{project_key}"
+        conn = self.db.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+
+            def mutate() -> tuple[int, dict[str, Any]]:
+                project = self._project_membership(conn, actor["id"], project_key)
+                maximum = conn.execute(
+                    """
+                    SELECT COALESCE(MAX(e.seq), 0) AS max_seq
+                    FROM deliveries d
+                    JOIN events e ON e.seq = d.event_seq
+                    WHERE d.user_id = ? AND e.project_id = ?
+                    """,
+                    (actor["id"], project["id"]),
+                ).fetchone()["max_seq"]
+                if through > maximum:
+                    raise ServiceError(
+                        409,
+                        "ack_beyond_delivery",
+                        "cannot acknowledge beyond the latest delivered event",
+                        {"requested_ack": through, "max_delivered_seq": maximum},
+                    )
+                current_row = conn.execute(
+                    """
+                    SELECT acked_through FROM project_inbox_cursors
+                    WHERE project_id = ? AND user_id = ?
+                    """,
+                    (project["id"], actor["id"]),
+                ).fetchone()
+                current = current_row["acked_through"] if current_row is not None else 0
+                if through < current:
+                    raise ServiceError(
+                        409,
+                        "ack_regression",
+                        "inbox acknowledgement cannot move backwards",
+                        {"requested_ack": through, "current_ack": current},
+                    )
+                now = self.db.now()
+                conn.execute(
+                    """
+                    INSERT INTO project_inbox_cursors(
+                        project_id, user_id, acked_through, updated_at
+                    ) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(project_id, user_id) DO UPDATE SET
+                        acked_through = excluded.acked_through,
+                        updated_at = excluded.updated_at
+                    """,
+                    (project["id"], actor["id"], through, now),
+                )
+                self.db._audit(
+                    conn,
+                    actor["id"],
+                    "project_inbox.acknowledged",
+                    project["id"],
+                    {"from_seq": current, "through": through},
+                )
+                return 200, {
+                    "trusted_metadata": {
+                        "project_key": project_key,
+                        "acked_through": through,
+                        "updated_at": now,
+                    }
+                }
+
+            result = self._idempotent(
+                conn, actor["id"], key, operation, canonical, mutate
+            )
+            conn.commit()
+            return result
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def _project_membership(
         self, conn: sqlite3.Connection, user_id: str, project_key: str
     ) -> sqlite3.Row:
@@ -1562,6 +1975,7 @@ class Service:
                 403,
                 "forbidden",
                 "project coordinator or admin role required",
+                {"required_roles": ["coordinator", "admin"]},
             )
 
     def _session_membership(
@@ -1614,8 +2028,121 @@ class Service:
     def _require_claim_version(claim: sqlite3.Row, expected_version: int) -> None:
         if claim["version"] != expected_version:
             raise ServiceError(
-                409, "version_conflict", "work-claim version has changed"
+                409,
+                "version_conflict",
+                "work-claim version has changed",
+                {
+                    "expected_version": expected_version,
+                    "current_version": claim["version"],
+                },
             )
+
+    def _create_item_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        project_id: str,
+        session_id: str,
+        actor_id: str,
+        recipient_handle: str,
+        claim_id: str | None,
+        title: str,
+        body: str,
+        flags: tuple[str, ...],
+    ) -> dict[str, Any]:
+        self._session_membership(conn, actor_id, project_id, session_id)
+        if claim_id is not None:
+            linked_claim = conn.execute(
+                "SELECT 1 FROM work_claims WHERE id = ? AND project_id = ?",
+                (claim_id, project_id),
+            ).fetchone()
+            if linked_claim is None:
+                raise ServiceError(
+                    404,
+                    "work_claim_not_found",
+                    "work claim not found in this project",
+                )
+        session = conn.execute(
+            "SELECT state FROM sessions WHERE id = ? AND project_id = ?",
+            (session_id, project_id),
+        ).fetchone()
+        if session is None:
+            raise ServiceError(404, "scope_not_found", "session scope not found")
+        if session["state"] != "active":
+            raise ServiceError(
+                409, "session_closed", "session does not accept new work"
+            )
+        recipient = conn.execute(
+            """
+            SELECT u.id, u.handle
+            FROM users u
+            JOIN session_members sm ON sm.user_id = u.id
+            WHERE u.handle = ? AND u.active = 1
+              AND sm.project_id = ? AND sm.session_id = ?
+            """,
+            (recipient_handle, project_id, session_id),
+        ).fetchone()
+        if recipient is None:
+            raise ServiceError(
+                404,
+                "recipient_not_found",
+                "recipient is not an active session participant",
+            )
+        if recipient["id"] == actor_id:
+            raise ServiceError(400, "self_assignment", "recipient must be another user")
+        open_count = conn.execute(
+            """
+            SELECT COUNT(*) AS count FROM items
+            WHERE project_id = ? AND session_id = ?
+              AND creator_id = ? AND recipient_id = ? AND status LIKE 'open.%'
+            """,
+            (project_id, session_id, actor_id, recipient["id"]),
+        ).fetchone()["count"]
+        if open_count >= MAX_OPEN_ITEMS_PER_ROUTE:
+            raise ServiceError(
+                429, "queue_limit", "too many open items for this recipient"
+            )
+
+        item_id = self.db.new_id("itm")
+        now = self.db.now()
+        conn.execute(
+            """
+            INSERT INTO items(
+                id, project_id, session_id, creator_id, recipient_id, work_claim_id,
+                title, body, risk_flags, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open.pending', ?, ?)
+            """,
+            (
+                item_id,
+                project_id,
+                session_id,
+                actor_id,
+                recipient["id"],
+                claim_id,
+                title,
+                body,
+                self._json_list(flags),
+                now,
+                now,
+            ),
+        )
+        event_seq = self._insert_event(
+            conn,
+            project_id,
+            session_id,
+            item_id,
+            actor_id,
+            "item.created",
+            None,
+            "open.pending",
+            None,
+            flags,
+            recipient["id"],
+        )
+        row = self._item_row(conn, project_id, session_id, item_id, actor_id)
+        response = self._serialize_item(row)
+        response["trusted_metadata"]["event_seq"] = event_seq
+        return response
 
     def _item_row(
         self,
@@ -1774,6 +2301,7 @@ class Service:
                 "external_id": row["external_id"],
                 "status": row["effective_status"],
                 "version": row["version"],
+                "review_round": row["review_round"],
                 "assignee": assignee,
                 "created_by": {
                     "user_id": row["created_by"],

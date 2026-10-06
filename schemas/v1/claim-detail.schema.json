@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/psyberone/imitation-krab/schemas/v1/claim-detail.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["claim", "review_history"],
+  "properties": {
+    "claim": {"$ref": "resources.schema.json#/$defs/claim"},
+    "review_history": {
+      "type": "array",
+      "items": {"$ref": "resources.schema.json#/$defs/review_history_event"}
+    }
+  }
+}

@@ -4,11 +4,11 @@
 agents. It is intentionally not a general chat service, workflow engine, or
 agent runtime.
 
-Each user has one server-generated bearer token and a private delivery queue.
-Every work item belongs to exactly one project and one session. Users can place
-work into another session participant's queue, update work through a fixed
-status machine, and send a bodyless reminder. They cannot inspect another
-user’s queue or open a peer-to-peer connection.
+Each user has one server-generated bearer token and private deliveries. Every
+work item belongs to exactly one project and one session. Users can read one
+session queue or their project-wide inbox, update work through a fixed status
+machine, and send a bodyless reminder. They cannot inspect another user’s
+deliveries or open a peer-to-peer connection.
 
 Each project also has two shared claim queues: issues and pull requests. They
 are filtered views over one small local registry, not GitHub integration.
@@ -16,7 +16,8 @@ Project coordinators and admins can register or additively import opaque
 external identifiers and assign available work. Members can atomically claim
 available work for themselves and submit completed work for independent
 review. A different coordinator or admin returns it for changes or approves
-and completes it. A work item may carry one immutable link to a registry entry.
+and completes it while atomically sending the assignee a linked verdict item.
+A work item may carry one immutable link to a registry entry.
 
 The v0 daemon binds to `127.0.0.1` by default, uses SQLite, and has no runtime
 package dependencies beyond Python 3.11 or newer. Its explicit container mode
@@ -79,6 +80,17 @@ Installing may obtain the standard `setuptools` build backend if it is absent.
 For a completely uninstalled/offline invocation, use
 `PYTHONPATH=src python3 -m imitation_krab` in place of `krab`.
 
+Client connection defaults can be set once per agent environment. The token
+itself remains in a private file rather than an environment variable:
+
+```console
+export KRAB_SERVER=http://127.0.0.1:8765
+export KRAB_TOKEN_FILE="$HOME/.config/imitation-krab/worker-one.token"
+krab projects
+```
+
+Explicit global `--server` and `--token-file` options override these defaults.
+
 The operational database defaults to
 `~/.local/state/imitation-krab/krab.db`, outside any agent workspace. Override
 it with `KRAB_STATE_DIR` or `KRAB_DB`; the selected state directory must be
@@ -135,13 +147,14 @@ docker compose ps
 curl --fail --silent http://127.0.0.1:8765/v1/health
 ```
 
-New images migrate an existing schema 1, 2, or 3 database to schema 4 at startup without
-deleting users, projects, sessions, messages, or claims. Take a verified backup
-before updating, then rebuild and recreate the service container:
+New images migrate an existing schema 1 through 4 database to schema 5 at
+startup without deleting users, projects, sessions, messages, or claims. Take
+a verified backup before updating, then rebuild and recreate the service
+container:
 
 ```console
 docker compose --profile admin run --rm krab-admin \
-  admin backup "/var/lib/imitation-krab/backups/krab-before-v4.db"
+  admin backup "/var/lib/imitation-krab/backups/krab-before-v5.db"
 docker compose build --pull
 docker compose up --detach --force-recreate krab
 ```
@@ -206,7 +219,7 @@ Project roles are deliberately fixed:
 | Role | Project capabilities |
 | --- | --- |
 | `member` | Read claim queues, self-claim, activate or submit assigned work, release claimed/active work, and participate in sessions |
-| `coordinator` | Member capabilities plus claim creation/import, explicit assignment, review of another assignee's work, and stale/review-claim release |
+| `coordinator` | Member capabilities plus claim creation/import, explicit assignment, atomic review of another assignee's work, and stale/review-claim release |
 | `admin` | Coordinator capabilities plus project-level override such as closing another creator's completed session |
 
 No role can create users, rotate credentials, or change membership over HTTP.
@@ -260,6 +273,27 @@ krab --token-file ~/.config/imitation-krab/worker-one.token \
   --session ses_0123456789abcdef0123456789abcdef \
   --watch
 ```
+
+For a coordinator, a project inbox combines only that authenticated user's
+deliveries from every session in the project:
+
+```console
+krab inbox --project imitation-krab --unread --watch
+```
+
+`--watch` repeatedly issues bounded 30-second long polls. A one-shot caller can
+instead use `--wait 30` on either `queue` or `inbox`. Reading never marks data
+as handled. After durably processing through the returned `next_cursor`, advance
+the per-user/project cursor explicitly:
+
+```console
+krab inbox-ack --project imitation-krab --through 1234
+```
+
+`inbox --unread` resumes strictly after that server-side cursor. An
+acknowledgement cannot move backwards or beyond an event actually delivered to
+that user. Inbox activity is not presence: silence does not say whether an
+agent is busy, disconnected, rate-limited, or gone.
 
 Console output escapes terminal controls and labels every user-controlled field
 as content. Add the global `--json` option for machine-readable output.
@@ -353,20 +387,26 @@ krab --token-file ~/.config/imitation-krab/worker-one.token \
 ```
 
 The assigned worker has now handed off version 4. A different coordinator or
-admin reviews it. They can request changes:
+admin reviews it. The verdict body is sanitized as untrusted content, and the
+state change plus linked delivery to the assignee commit in one transaction.
+They can request changes:
 
 ```console
 krab --token-file ~/.config/imitation-krab/primary-dev.token \
-  claim-status clm_0123456789abcdef0123456789abcdef active \
-  --project imitation-krab --kind issue --expected-version 4
+  claim-review clm_0123456789abcdef0123456789abcdef changes-requested \
+  --project imitation-krab --kind issue \
+  --session ses_0123456789abcdef0123456789abcdef \
+  --expected-version 4 --body-file review.txt
 ```
 
 After the assignee resubmits, the reviewer can approve and complete it:
 
 ```console
 krab --token-file ~/.config/imitation-krab/primary-dev.token \
-  claim-status clm_0123456789abcdef0123456789abcdef done \
-  --project imitation-krab --kind issue --expected-version 6
+  claim-review clm_0123456789abcdef0123456789abcdef approved \
+  --project imitation-krab --kind issue \
+  --session ses_0123456789abcdef0123456789abcdef \
+  --expected-version 6 --body-file approval.txt
 ```
 
 The fixed lifecycle is
@@ -380,9 +420,18 @@ clearing the review marker. `done` is terminal. Every claim, assignment,
 release, and status mutation requires the version last observed, and competing
 attempts produce one winner.
 
-Review explanations still belong in session work-item messages. Claims do not
-gain prose, labels, priorities, dependencies, reservations, or automatic
-notifications, and Krab neither queries nor mutates GitHub.
+Each submission increments a server-owned review round. Inspect its narrow,
+trusted transition history with:
+
+```console
+krab claim-show clm_0123456789abcdef0123456789abcdef \
+  --project imitation-krab --kind issue
+```
+
+The history exposes only allowlisted submission/verdict metadata. Verdict prose
+remains in the linked private item. Claims do not gain labels, priorities,
+dependencies, reservations, or arbitrary notifications, and Krab neither
+queries nor mutates GitHub.
 
 Link a message at creation time with `send --claim clm_...`. The link, project,
 kind, and external identifier are immutable. Claim state and message status are
@@ -431,7 +480,9 @@ krab --token-file ~/.config/imitation-krab/worker-one.token \
 ```
 
 Stale versions fail with `409 version_conflict` rather than overwriting newer
-state.
+state. The JSON error includes `expected_version` and `current_version` when the
+current value is known. Authorization failures for reviews include the roles
+that can act.
 
 ## HTTP API
 
@@ -451,6 +502,8 @@ POST  /v1/projects/{project}/issues/import
 POST  /v1/projects/{project}/issues/{claim}/assign
 POST  /v1/projects/{project}/issues/{claim}/claim
 POST  /v1/projects/{project}/issues/{claim}/release
+POST  /v1/projects/{project}/issues/{claim}/review
+GET   /v1/projects/{project}/issues/{claim}
 PATCH /v1/projects/{project}/issues/{claim}/status
 
 GET   /v1/projects/{project}/pull-requests?status=active&assignee=worker-one
@@ -459,7 +512,12 @@ POST  /v1/projects/{project}/pull-requests/import
 POST  /v1/projects/{project}/pull-requests/{claim}/assign
 POST  /v1/projects/{project}/pull-requests/{claim}/claim
 POST  /v1/projects/{project}/pull-requests/{claim}/release
+POST  /v1/projects/{project}/pull-requests/{claim}/review
+GET   /v1/projects/{project}/pull-requests/{claim}
 PATCH /v1/projects/{project}/pull-requests/{claim}/status
+
+GET   /v1/projects/{project}/inbox?unread=1&limit=50&wait=30
+POST  /v1/projects/{project}/inbox/ack
 
 GET   /v1/projects/{project}/sessions
 POST  /v1/projects/{project}/sessions
@@ -473,8 +531,10 @@ POST  /v1/projects/{project}/sessions/{session}/items/{item}/notify
 GET   /v1/projects/{project}/sessions/{session}/queue?after=0&limit=50&wait=30
 ```
 
-Queue cursors are maintained independently for each project/session. Long poll
-waits are capped at 30 seconds. A reminder has no text body and is throttled.
+Session queue cursors are caller supplied. The project inbox additionally has
+an explicit durable cursor per authenticated user and project. Long-poll waits
+are capped at 30 seconds and two concurrent waits per user. A reminder has no
+text body and is throttled.
 
 Responses keep provenance separate from content:
 
@@ -497,6 +557,9 @@ Responses keep provenance separate from content:
 
 Client software must preserve that trust distinction. Encoding text as JSON
 does not make its instructions trustworthy.
+
+Versioned response schemas and their command mapping are in
+[`schemas/`](schemas/README.md). They describe envelopes, not authority.
 
 An `external_id` appears in authenticated metadata because the server has
 validated its restricted representation and immutable registry relationship.

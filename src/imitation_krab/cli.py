@@ -122,9 +122,18 @@ class APIClient:
                 parsed = json.loads(raw.decode("utf-8"))
                 message = parsed.get("error", {}).get("message", f"HTTP {status}")
                 code = parsed.get("error", {}).get("code", "http_error")
+                details = parsed.get("error", {}).get("details")
             except (UnicodeError, json.JSONDecodeError, AttributeError):
-                code, message = "http_error", f"HTTP {status}"
-            raise ClientError(f"{code}: {message}") from None
+                code, message, details = "http_error", f"HTTP {status}", None
+            suffix = (
+                "; details="
+                + json.dumps(
+                    details, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+                )
+                if isinstance(details, dict)
+                else ""
+            )
+            raise ClientError(f"{code}: {message}{suffix}") from None
         try:
             result = json.loads(raw.decode("utf-8"))
         except (UnicodeError, json.JSONDecodeError) as exc:
@@ -246,12 +255,29 @@ def build_parser() -> argparse.ArgumentParser:
     claim_release.add_argument("--expected-version", type=int, required=True)
 
     claim_status = sub.add_parser(
-        "claim-status", help="activate, submit, or review claimed work"
+        "claim-status", help="activate or submit assigned work"
     )
     claim_status.add_argument("claim_id")
-    claim_status.add_argument("status", choices=["active", "under-review", "done"])
+    claim_status.add_argument("status", choices=["active", "under-review"])
     _add_claim_scope_args(claim_status)
     claim_status.add_argument("--expected-version", type=int, required=True)
+
+    claim_review = sub.add_parser(
+        "claim-review",
+        help="atomically record a reviewer verdict and notify the assignee",
+    )
+    claim_review.add_argument("claim_id")
+    claim_review.add_argument("action", choices=["changes-requested", "approved"])
+    _add_claim_scope_args(claim_review)
+    claim_review.add_argument("--session", required=True)
+    claim_review.add_argument("--expected-version", type=int, required=True)
+    _add_text_source(claim_review, "body", required=True)
+
+    claim_show = sub.add_parser(
+        "claim-show", help="show a claim and its trusted review history"
+    )
+    claim_show.add_argument("claim_id")
+    _add_claim_scope_args(claim_show)
 
     sessions = sub.add_parser("sessions", help="list sessions in a project")
     sessions.add_argument("--project", required=True)
@@ -282,7 +308,27 @@ def build_parser() -> argparse.ArgumentParser:
     _add_scope_args(queue)
     queue.add_argument("--after", type=int, default=0)
     queue.add_argument("--limit", type=int, default=50)
-    queue.add_argument("--watch", action="store_true")
+    queue_wait = queue.add_mutually_exclusive_group()
+    queue_wait.add_argument("--watch", action="store_true")
+    queue_wait.add_argument("--wait", type=int, default=0)
+
+    inbox = sub.add_parser(
+        "inbox", help="read private deliveries across every session in a project"
+    )
+    inbox.add_argument("--project", required=True)
+    inbox_cursor = inbox.add_mutually_exclusive_group()
+    inbox_cursor.add_argument("--after", type=int)
+    inbox_cursor.add_argument("--unread", action="store_true")
+    inbox.add_argument("--limit", type=int, default=50)
+    inbox_wait = inbox.add_mutually_exclusive_group()
+    inbox_wait.add_argument("--watch", action="store_true")
+    inbox_wait.add_argument("--wait", type=int, default=0)
+
+    inbox_ack = sub.add_parser(
+        "inbox-ack", help="explicitly advance the durable project inbox cursor"
+    )
+    inbox_ack.add_argument("--project", required=True)
+    inbox_ack.add_argument("--through", type=int, required=True)
 
     show = sub.add_parser("show", help="show an accessible work item and history")
     _add_scope_args(show)
@@ -476,6 +522,21 @@ def _run_client(args: argparse.Namespace, client: APIClient) -> int:
             },
         )
         _emit(args, result, kind="claim")
+    elif command == "claim-review":
+        result = client.request(
+            "POST",
+            _claim_path(args) + "/review",
+            payload={
+                "action": args.action.replace("-", "_"),
+                "expected_version": args.expected_version,
+                "session_id": args.session,
+                "body": _text_argument(args, "body"),
+            },
+        )
+        _emit(args, result, kind="review")
+    elif command == "claim-show":
+        result = client.request("GET", _claim_path(args))
+        _emit(args, result, kind="claim-detail")
     elif command == "sessions":
         result = client.request(
             "GET", f"/v1/projects/{_segment(args.project)}/sessions"
@@ -519,13 +580,42 @@ def _run_client(args: argparse.Namespace, client: APIClient) -> int:
                 query={
                     "after": cursor,
                     "limit": args.limit,
-                    "wait": 30 if args.watch else 0,
+                    "wait": 30 if args.watch else args.wait,
                 },
             )
             _emit(args, result, kind="queue")
             cursor = result["trusted_metadata"]["next_cursor"]
             if not args.watch:
                 break
+    elif command == "inbox":
+        cursor = args.after
+        first = True
+        while True:
+            query: dict[str, Any] = {
+                "limit": args.limit,
+                "wait": 30 if args.watch else args.wait,
+            }
+            if first and args.unread:
+                query["unread"] = 1
+            else:
+                query["after"] = cursor if cursor is not None else 0
+            result = client.request(
+                "GET",
+                f"/v1/projects/{_segment(args.project)}/inbox",
+                query=query,
+            )
+            _emit(args, result, kind="queue")
+            cursor = result["trusted_metadata"]["next_cursor"]
+            first = False
+            if not args.watch:
+                break
+    elif command == "inbox-ack":
+        result = client.request(
+            "POST",
+            f"/v1/projects/{_segment(args.project)}/inbox/ack",
+            payload={"through": args.through},
+        )
+        _emit(args, result)
     elif command == "show":
         result = client.request(
             "GET", _scope_path(args) + f"/items/{_segment(args.item)}"
@@ -800,6 +890,25 @@ def _emit(
         return
     if kind == "claim":
         _print_claim(payload)
+        return
+    if kind == "review":
+        meta = payload["trusted_metadata"]
+        print(f"review {meta['action']} round={meta['review_round']}")
+        _print_claim(payload["claim"])
+        _print_item(payload["notification"])
+        return
+    if kind == "claim-detail":
+        _print_claim(payload["claim"])
+        for event in payload.get("review_history", []):
+            meta = event["trusted_metadata"]
+            actor = meta["actor"]["handle"]
+            transition = (
+                f"{meta.get('from_status') or '-'} -> {meta.get('to_status') or '-'}"
+            )
+            print(
+                f"  review round={meta['review_round']} {meta['action']} "
+                f"by {actor} {transition} at {meta['created_at']}"
+            )
         return
     if kind == "item":
         _print_item(payload)

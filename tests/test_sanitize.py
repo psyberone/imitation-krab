@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -142,6 +143,44 @@ class SanitizeTests(unittest.TestCase):
         )
         self.assertEqual(review.status, "under-review")
 
+        verdict = build_parser().parse_args(
+            [
+                "claim-review",
+                "clm_" + "e" * 32,
+                "changes-requested",
+                "--project",
+                "project-one",
+                "--kind",
+                "issue",
+                "--session",
+                "ses_" + "f" * 32,
+                "--expected-version",
+                "4",
+                "--body-file",
+                "verdict.txt",
+            ]
+        )
+        self.assertEqual(verdict.action, "changes-requested")
+        self.assertEqual(verdict.body_file, Path("verdict.txt"))
+
+        claim_show = build_parser().parse_args(
+            [
+                "claim-show",
+                "clm_" + "a" * 32,
+                "--project",
+                "project-one",
+                "--kind",
+                "pr",
+            ]
+        )
+        self.assertEqual(claim_show.command, "claim-show")
+
+        inbox = build_parser().parse_args(
+            ["inbox", "--project", "project-one", "--unread", "--watch"]
+        )
+        self.assertTrue(inbox.unread)
+        self.assertTrue(inbox.watch)
+
     def test_claim_cli_maps_filters_and_review_status_to_api_values(self) -> None:
         class RecordingClient:
             def __init__(self) -> None:
@@ -149,6 +188,11 @@ class SanitizeTests(unittest.TestCase):
 
             def request(self, method: str, path: str, **kwargs: object) -> dict:
                 self.calls.append((method, path, kwargs))
+                if path.endswith("/inbox"):
+                    return {
+                        "trusted_metadata": {"next_cursor": 0},
+                        "events": [],
+                    }
                 return {"claims": []}
 
         client = RecordingClient()
@@ -198,6 +242,84 @@ class SanitizeTests(unittest.TestCase):
             client.calls[0][2]["payload"],
             {"status": "under_review", "expected_version": 3},
         )
+
+        client.calls.clear()
+        args = build_parser().parse_args(
+            [
+                "--json",
+                "claim-review",
+                "clm_" + "e" * 32,
+                "approved",
+                "--project",
+                "project-one",
+                "--kind",
+                "pr",
+                "--session",
+                "ses_" + "f" * 32,
+                "--expected-version",
+                "6",
+                "--body",
+                "Approved upstream.",
+            ]
+        )
+        with redirect_stdout(StringIO()):
+            _run_client(args, client)  # type: ignore[arg-type]
+        self.assertEqual(
+            client.calls,
+            [
+                (
+                    "POST",
+                    "/v1/projects/project-one/pull-requests/clm_"
+                    + "e" * 32
+                    + "/review",
+                    {
+                        "payload": {
+                            "action": "approved",
+                            "expected_version": 6,
+                            "session_id": "ses_" + "f" * 32,
+                            "body": "Approved upstream.",
+                        }
+                    },
+                )
+            ],
+        )
+
+        client.calls.clear()
+        args = build_parser().parse_args(
+            [
+                "--json",
+                "inbox",
+                "--project",
+                "project-one",
+                "--unread",
+                "--wait",
+                "12",
+            ]
+        )
+        with redirect_stdout(StringIO()):
+            _run_client(args, client)  # type: ignore[arg-type]
+        self.assertEqual(
+            client.calls,
+            [
+                (
+                    "GET",
+                    "/v1/projects/project-one/inbox",
+                    {"query": {"limit": 50, "wait": 12, "unread": 1}},
+                )
+            ],
+        )
+
+    def test_client_defaults_can_come_from_environment(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "KRAB_SERVER": "http://localhost:9876",
+                "KRAB_TOKEN_FILE": "/private/agent.token",
+            },
+        ):
+            args = build_parser().parse_args(["projects"])
+        self.assertEqual(args.server, "http://localhost:9876")
+        self.assertEqual(args.token_file, Path("/private/agent.token"))
 
     def test_claim_manifest_is_a_bounded_array_of_safe_unique_ids(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -359,6 +481,30 @@ class SanitizeTests(unittest.TestCase):
         ):
             connection.return_value.request.side_effect = OSError("connection lost")
             client.request("POST", "/v1/example", payload={})
+
+    def test_client_preserves_structured_recovery_details(self) -> None:
+        token = "krab_usr_" + "a" * 32 + "_" + "b" * 43
+        client = APIClient("http://127.0.0.1:8765", token)
+        response_body = json.dumps(
+            {
+                "error": {
+                    "code": "version_conflict",
+                    "message": "work-claim version has changed",
+                    "details": {"expected_version": 3, "current_version": 4},
+                }
+            }
+        ).encode()
+        with (
+            patch("imitation_krab.cli.http.client.HTTPConnection") as connection,
+            self.assertRaisesRegex(
+                ClientError,
+                r'details=\{"current_version":4,"expected_version":3\}',
+            ),
+        ):
+            response = connection.return_value.getresponse.return_value
+            response.status = 409
+            response.read.return_value = response_body
+            client.request("GET", "/v1/example")
 
 
 if __name__ == "__main__":

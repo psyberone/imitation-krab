@@ -1,0 +1,5 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/psyberone/imitation-krab/schemas/v1/claim.schema.json",
+  "$ref": "resources.schema.json#/$defs/claim"
+}

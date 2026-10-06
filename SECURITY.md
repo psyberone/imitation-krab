@@ -37,12 +37,16 @@ the raw bearer token in model context.
     work to an active member of the same project and cannot silently reassign it.
 13. Only the assignee can activate or submit their claim. Only a different
     coordinator or admin can return submitted work or approve it as done; role
-    membership never permits self-approval. The assignee can release claimed or
-    active work, while a coordinator/admin can also release submitted work.
-    Imported identifiers are additive: omission never mutates or removes an
-    existing claim.
+    membership never permits self-approval. A reviewer verdict, linked private
+    notification, delivery event, review-round record, and claim transition
+    commit atomically. The assignee can release claimed or active work, while a
+    coordinator/admin can also release submitted work. Imported identifiers are
+    additive: omission never mutates or removes an existing claim.
 14. A message-to-claim link is immutable and cannot cross a project boundary.
     Message and claim lifecycles do not grant authority to one another.
+15. A project inbox is a union only of deliveries addressed to the authenticated
+    user. Durable acknowledgement is explicit, monotonic, and cannot advance
+    beyond that user's delivered events in the project.
 
 ## Trust boundaries
 
@@ -52,11 +56,12 @@ The server owns user IDs, authenticated sender identity, project/session
 relationships, timestamps, event sequence numbers, status, versions, and
 routing. These values are never derived from message prose.
 
-Claim kind, assignment, effective state, review marker, version, and linkage
-are server-enforced control data. An external work identifier is restricted
-ASCII and immutable once registered, but remains a coordinator/admin-supplied
-local reference. Its presence does not prove that a GitHub object exists or
-authorize any GitHub operation.
+Claim kind, assignment, effective state, review marker, review round, version,
+and linkage are server-enforced control data. A verdict action is structured
+control data; its body remains untrusted prose. An external work identifier is
+restricted ASCII and immutable once registered, but remains a
+coordinator/admin-supplied local reference. Its presence does not prove that a
+GitHub object exists or authorize any GitHub operation.
 
 Project roles are fixed rather than user-defined. Members perform work,
 coordinators may populate and manage the project claim queue, and admins retain
@@ -98,10 +103,13 @@ content.
 | Malicious or incomplete import | Restricted identifier-only schema, 100-entry cap, duplicate rejection, atomic additive transaction, and no deletion or mutation by omission |
 | Unauthorized assignment | Coordinator/admin check, active same-project assignee lookup, available-only transition, expected version, and audit entry |
 | Self-approval or forged review | Assignee identity check, independent coordinator/admin requirement, fixed transitions, expected version, and distinct audited verdicts |
+| Verdict transition without notifying the assignee | Dedicated idempotent transaction creates the linked item and delivery with the claim transition or rolls all of it back |
 | Stale or abandoned claim | Assignee release for claimed/active work; coordinator/admin release including atomic review-marker cleanup; reassignment remains an explicit release followed by assignment |
 | Forged/cross-project work link | Opaque claim IDs, membership checks, foreign key, same-project trigger, and immutable-link trigger |
 | Malicious external identifier | Restricted ASCII and length, opaque-reference semantics, no URL parsing/fetching, and no external action |
 | Retry duplication or replay confusion | Required idempotency keys bound to actor, operation, and request hash |
+| Cross-session inbox disclosure | Project membership plus authenticated-user delivery rows and session-membership joins; no project-wide broadcast rows |
+| Lost or forged read position | Explicit per-user/project monotonic acknowledgement bounded by the highest event delivered to that same user |
 | Queue flooding | Request throttles, per-user long-poll concurrency, participant/session/event limits, message-size limits, per-route open-item cap, and database-size cap |
 | Terminal/log injection | Dangerous controls rejected on ingress; console escapes again on output; structured logs omit bodies |
 | JSON ambiguity | Strict UTF-8, body cap, duplicate-key rejection, finite JSON numbers, unknown-field rejection |
@@ -186,6 +194,11 @@ checks limit other users' data, not that user's own blast radius.
   substitute for GitHub permissions and branch protection.
 - Review readiness is a local handoff marker, not proof of a GitHub review,
   branch status, test result, or merge authorization.
+- Project inbox delivery and acknowledgement are not presence. The service has
+  no heartbeat and cannot distinguish a working, disconnected, paused,
+  rate-limited, or dead agent.
+- Acknowledgement means only that a client explicitly advanced its Krab cursor;
+  it does not prove that an agent understood, accepted, or completed the work.
 - There is no automatic retention or archive operation. The 256 MiB database
   ceiling prevents host-disk exhaustion, but a malicious or long-running user
   can still consume that allowance and deny future writes until an operator

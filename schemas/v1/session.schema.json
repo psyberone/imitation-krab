@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/psyberone/imitation-krab/schemas/v1/session.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["trusted_metadata", "untrusted_text", "content_risk_flags"],
+  "properties": {
+    "trusted_metadata": {
+      "type": "object",
+      "required": ["session_id", "project_key", "state", "created_by", "created_at"],
+      "properties": {
+        "session_id": {"type": "string", "pattern": "^ses_[0-9a-f]{32}$"},
+        "project_id": {"type": "string", "pattern": "^prj_[0-9a-f]{32}$"},
+        "project_key": {"type": "string"},
+        "state": {"enum": ["active", "closed"]},
+        "created_by": {"type": "string", "pattern": "^usr_[0-9a-f]{32}$"},
+        "participants": {"type": "array", "items": {"$ref": "resources.schema.json#/$defs/user"}},
+        "created_at": {"type": "string", "format": "date-time"},
+        "closed_at": {"type": ["string", "null"], "format": "date-time"}
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "required": ["state"],
+            "properties": {"state": {"const": "closed"}}
+          },
+          "then": {
+            "required": ["closed_at"],
+            "properties": {"closed_at": {"type": "string", "format": "date-time"}}
+          }
+        },
+        {
+          "if": {
+            "required": ["state"],
+            "properties": {"state": {"const": "active"}}
+          },
+          "then": {
+            "properties": {"closed_at": {"type": "null"}}
+          }
+        }
+      ]
+    },
+    "untrusted_text": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["label"],
+      "properties": {"label": {"type": "string"}}
+    },
+    "content_risk_flags": {"$ref": "resources.schema.json#/$defs/risk_flags"}
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/psyberone/imitation-krab/schemas/v1/review-result.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["trusted_metadata", "claim", "notification"],
+  "properties": {
+    "trusted_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action", "review_round", "notification_item_id", "notification_event_seq"],
+      "properties": {
+        "action": {"enum": ["changes_requested", "approved"]},
+        "review_round": {"type": "integer", "minimum": 1},
+        "notification_item_id": {"type": "string", "pattern": "^itm_[0-9a-f]{32}$"},
+        "notification_event_seq": {"type": "integer", "minimum": 1}
+      }
+    },
+    "claim": {"$ref": "resources.schema.json#/$defs/claim"},
+    "notification": {"$ref": "resources.schema.json#/$defs/item"}
+  }
+}

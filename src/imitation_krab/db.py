@@ -18,7 +18,7 @@ from .config import MAX_DATABASE_BYTES, default_db_path, default_pepper_path
 from .sanitize import sanitize_text, validate_handle, validate_project_key
 
 TOKEN_RE = re.compile(r"^krab_(usr_[0-9a-f]{32})_([A-Za-z0-9_-]{43})$")
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 SCHEMA = """
@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS work_claims (
         'available', 'claimed', 'active', 'done'
     )),
     version INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
+    review_round INTEGER NOT NULL DEFAULT 0 CHECK (review_round >= 0),
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -182,6 +183,16 @@ CREATE TABLE IF NOT EXISTS deliveries (
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE RESTRICT
 );
 
+CREATE TABLE IF NOT EXISTS project_inbox_cursors (
+    project_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    acked_through INTEGER NOT NULL DEFAULT 0 CHECK (acked_through >= 0),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (project_id, user_id),
+    FOREIGN KEY (project_id, user_id)
+        REFERENCES project_members(project_id, user_id) ON DELETE RESTRICT
+);
+
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     user_id TEXT NOT NULL,
     key TEXT NOT NULL,
@@ -220,6 +231,8 @@ CREATE INDEX IF NOT EXISTS idx_events_item
     ON events(item_id, seq);
 CREATE INDEX IF NOT EXISTS idx_deliveries_user_event
     ON deliveries(user_id, event_seq);
+CREATE INDEX IF NOT EXISTS idx_audit_action_target
+    ON audit_log(action, target, seq);
 
 CREATE TRIGGER IF NOT EXISTS items_work_claim_scope_insert
 BEFORE INSERT ON items
@@ -364,6 +377,30 @@ MIGRATION_3_TO_4 = (
 )
 
 
+MIGRATION_4_TO_5 = (
+    """
+    ALTER TABLE work_claims ADD COLUMN review_round INTEGER NOT NULL
+        DEFAULT 0 CHECK (review_round >= 0)
+    """,
+    """
+    UPDATE work_claims
+    SET review_round = 1
+    WHERE id IN (SELECT claim_id FROM work_claim_review_requests)
+    """,
+    """
+    CREATE TABLE project_inbox_cursors (
+        project_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        acked_through INTEGER NOT NULL DEFAULT 0 CHECK (acked_through >= 0),
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (project_id, user_id),
+        FOREIGN KEY (project_id, user_id)
+            REFERENCES project_members(project_id, user_id) ON DELETE RESTRICT
+    )
+    """,
+)
+
+
 class DatabaseError(RuntimeError):
     pass
 
@@ -458,7 +495,7 @@ class Database:
         version = rows[0]["version"]
         if version == SCHEMA_VERSION:
             return
-        if version not in {1, 2, 3}:
+        if version not in {1, 2, 3, 4}:
             raise DatabaseError("unsupported database schema version")
 
         try:
@@ -467,7 +504,7 @@ class Database:
             if len(locked_rows) != 1:
                 raise DatabaseError("database schema metadata is invalid")
             locked_version = locked_rows[0]["version"]
-            if locked_version not in {1, 2, 3, SCHEMA_VERSION}:
+            if locked_version not in {1, 2, 3, 4, SCHEMA_VERSION}:
                 raise DatabaseError("unsupported database schema version")
             if locked_version == 1:
                 for statement in MIGRATION_1_TO_2:
@@ -482,8 +519,35 @@ class Database:
             if locked_version == 3:
                 for statement in MIGRATION_3_TO_4:
                     conn.execute(statement)
+                conn.execute("UPDATE schema_meta SET version = 4 WHERE version = 3")
+                locked_version = 4
+            if locked_version == 4:
+                for statement in MIGRATION_4_TO_5:
+                    conn.execute(statement)
+                audit_table = conn.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'audit_log'"
+                ).fetchone()
+                if audit_table is not None:
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_audit_action_target "
+                        "ON audit_log(action, target, seq)"
+                    )
+                    conn.execute("""
+                        UPDATE work_claims
+                        SET review_round = (
+                            SELECT COUNT(*) FROM audit_log
+                            WHERE target = work_claims.id
+                              AND action = 'work_claim.submitted'
+                        )
+                        WHERE review_round < (
+                            SELECT COUNT(*) FROM audit_log
+                            WHERE target = work_claims.id
+                              AND action = 'work_claim.submitted'
+                        )
+                        """)
                 conn.execute(
-                    "UPDATE schema_meta SET version = ? WHERE version = 3",
+                    "UPDATE schema_meta SET version = ? WHERE version = 4",
                     (SCHEMA_VERSION,),
                 )
             conn.commit()

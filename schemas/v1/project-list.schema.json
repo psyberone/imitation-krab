@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/psyberone/imitation-krab/schemas/v1/project-list.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["projects"],
+  "properties": {
+    "projects": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["trusted_metadata", "untrusted_text", "content_risk_flags"],
+        "properties": {
+          "trusted_metadata": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["project_id", "project_key", "role"],
+            "properties": {
+              "project_id": {"type": "string", "pattern": "^prj_[0-9a-f]{32}$"},
+              "project_key": {"type": "string"},
+              "role": {"enum": ["member", "coordinator", "admin"]}
+            }
+          },
+          "untrusted_text": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["label"],
+            "properties": {"label": {"type": "string"}}
+          },
+          "content_risk_flags": {"$ref": "resources.schema.json#/$defs/risk_flags"}
+        }
+      }
+    }
+  }
+}

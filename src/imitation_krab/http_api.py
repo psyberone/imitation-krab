@@ -239,7 +239,7 @@ class KrabRequestHandler(BaseHTTPRequestHandler):
             headers = {"Retry-After": "60"} if status == 429 else None
             self._json_response(
                 status,
-                self._error(exc.code, exc.message),
+                self._error(exc.code, exc.message, exc.details),
                 request_id=request_id,
                 extra_headers=headers,
             )
@@ -301,6 +301,51 @@ class KrabRequestHandler(BaseHTTPRequestHandler):
                 status=query.get("status", [None])[0],
                 assignee=query.get("assignee", [None])[0],
             )
+        if (
+            len(path) == 5
+            and path[:2] == ["v1", "projects"]
+            and path[3] in CLAIM_QUEUE_KINDS
+        ):
+            self._require_query(query, set())
+            return 200, self.server.service.get_work_claim(
+                actor,
+                path[2],
+                CLAIM_QUEUE_KINDS[path[3]],
+                path[4],
+            )
+        if len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "inbox":
+            self._require_query(query, {"after", "limit", "wait", "unread"})
+            unread = self._query_bool(query, "unread", False)
+            after = (
+                None
+                if unread and "after" not in query
+                else self._query_int(query, "after", 0)
+            )
+            limit = self._query_int(query, "limit", 50)
+            wait = self._query_int(query, "wait", 0)
+            acquired = False
+            if wait:
+                acquired = self.server.long_polls.acquire(
+                    actor["id"], MAX_LONG_POLLS_PER_USER
+                )
+                if not acquired:
+                    raise ServiceError(
+                        429,
+                        "long_poll_limit",
+                        "too many concurrent long polls for this user",
+                    )
+            try:
+                return 200, self.server.service.get_project_inbox(
+                    actor,
+                    path[2],
+                    after=after,
+                    limit=limit,
+                    wait=wait,
+                    unread=unread,
+                )
+            finally:
+                if acquired:
+                    self.server.long_polls.release(actor["id"])
         if len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "sessions":
             self._require_query(query, set())
             return 200, self.server.service.list_sessions(actor, path[2])
@@ -363,6 +408,20 @@ class KrabRequestHandler(BaseHTTPRequestHandler):
                 idempotency_key,
             )
         if (
+            len(path) == 6
+            and path[:2] == ["v1", "projects"]
+            and path[3] in CLAIM_QUEUE_KINDS
+            and path[5] == "review"
+        ):
+            return self.server.service.review_work(
+                actor,
+                path[2],
+                CLAIM_QUEUE_KINDS[path[3]],
+                path[4],
+                body,
+                idempotency_key,
+            )
+        if (
             len(path) == 4
             and path[:2] == ["v1", "projects"]
             and path[3] in CLAIM_QUEUE_KINDS
@@ -418,6 +477,14 @@ class KrabRequestHandler(BaseHTTPRequestHandler):
             )
         if len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "sessions":
             return self.server.service.create_session(
+                actor, path[2], body, idempotency_key
+            )
+        if (
+            len(path) == 5
+            and path[:2] == ["v1", "projects"]
+            and path[3:] == ["inbox", "ack"]
+        ):
+            return self.server.service.ack_project_inbox(
                 actor, path[2], body, idempotency_key
             )
         if (
@@ -620,6 +687,17 @@ class KrabRequestHandler(BaseHTTPRequestHandler):
                 400, "invalid_query", f"{name} must be an integer"
             ) from exc
 
+    @staticmethod
+    def _query_bool(query: dict[str, list[str]], name: str, default: bool) -> bool:
+        if name not in query:
+            return default
+        value = query[name][0]
+        if value == "1":
+            return True
+        if value == "0":
+            return False
+        raise ServiceError(400, "invalid_query", f"{name} must be 0 or 1")
+
     def _json_response(
         self,
         status: int,
@@ -646,8 +724,15 @@ class KrabRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     @staticmethod
-    def _error(code: str, message: str) -> dict[str, Any]:
-        return {"error": {"code": code, "message": message}}
+    def _error(
+        code: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        error: dict[str, Any] = {"code": code, "message": message}
+        if details is not None:
+            error["details"] = details
+        return {"error": error}
 
     def log_message(self, format: str, *args: Any) -> None:
         # The structured request log in _dispatch deliberately omits headers and bodies.

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/psyberone/imitation-krab/schemas/v1/queue.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["trusted_metadata", "events"],
+  "properties": {
+    "trusted_metadata": {
+      "type": "object",
+      "required": ["project_key", "after", "next_cursor"],
+      "properties": {
+        "project_key": {"type": "string"},
+        "session_id": {"type": "string", "pattern": "^ses_[0-9a-f]{32}$"},
+        "after": {"type": "integer", "minimum": 0},
+        "next_cursor": {"type": "integer", "minimum": 0},
+        "acked_through": {"type": "integer", "minimum": 0},
+        "unread": {"type": "boolean"}
+      },
+      "additionalProperties": false,
+      "oneOf": [
+        {"required": ["session_id"]},
+        {"required": ["acked_through", "unread"]}
+      ]
+    },
+    "events": {"type": "array", "items": {"$ref": "resources.schema.json#/$defs/event"}}
+  }
+}

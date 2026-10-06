@@ -393,6 +393,15 @@ class HTTPAPITests(unittest.TestCase):
 
     def test_http_review_handoff_and_claim_filters(self) -> None:
         issue_path = "/v1/projects/project-one/issues"
+        status, session, _ = self.request(
+            "POST",
+            "/v1/projects/project-one/sessions",
+            self.primary_token,
+            {"label": "Claim review", "participants": ["bob"]},
+            key="http-review-session-0001",
+        )
+        self.assertEqual(status, 201, session)
+        review_session = session["trusted_metadata"]["session_id"]
         status, imported, _ = self.request(
             "POST",
             f"{issue_path}/import",
@@ -451,15 +460,60 @@ class HTTPAPITests(unittest.TestCase):
         )
         self.assertEqual(status, 403, denied)
         self.assertEqual(denied["error"]["code"], "self_approval")
+        self.assertEqual(
+            denied["error"]["details"]["required_roles"],
+            ["coordinator", "admin"],
+        )
 
-        status, changes, _ = self.request(
+        status, generic, _ = self.request(
             "PATCH",
             f"{issue_path}/{claim_id}/status",
             self.primary_token,
             {"status": "active", "expected_version": 4},
+            key="http-review-generic-changes-0001",
+        )
+        self.assertEqual(status, 409, generic)
+        self.assertEqual(generic["error"]["code"], "review_verdict_required")
+        self.assertEqual(generic["error"]["details"]["operation"], "claim-review")
+
+        status, changes, _ = self.request(
+            "POST",
+            f"{issue_path}/{claim_id}/review",
+            self.primary_token,
+            {
+                "action": "changes_requested",
+                "expected_version": 4,
+                "session_id": review_session,
+                "body": "Please revise the implementation.",
+            },
             key="http-review-changes-0001",
         )
         self.assertEqual(status, 200, changes)
+        self.assertEqual(changes["claim"]["trusted_metadata"]["status"], "active")
+        notification_seq = changes["trusted_metadata"]["notification_event_seq"]
+
+        status, inbox, _ = self.request(
+            "GET", "/v1/projects/project-one/inbox?unread=1", self.bob_token
+        )
+        self.assertEqual(status, 200, inbox)
+        self.assertEqual(
+            [event["trusted_metadata"]["event_seq"] for event in inbox["events"]],
+            [notification_seq],
+        )
+        status, acknowledged, _ = self.request(
+            "POST",
+            "/v1/projects/project-one/inbox/ack",
+            self.bob_token,
+            {"through": notification_seq},
+            key="http-inbox-ack-0001",
+        )
+        self.assertEqual(status, 200, acknowledged)
+        status, unread, _ = self.request(
+            "GET", "/v1/projects/project-one/inbox?unread=1", self.bob_token
+        )
+        self.assertEqual(status, 200, unread)
+        self.assertEqual(unread["events"], [])
+
         status, resubmitted, _ = self.request(
             "PATCH",
             f"{issue_path}/{claim_id}/status",
@@ -469,14 +523,28 @@ class HTTPAPITests(unittest.TestCase):
         )
         self.assertEqual(status, 200, resubmitted)
         status, approved, _ = self.request(
-            "PATCH",
-            f"{issue_path}/{claim_id}/status",
+            "POST",
+            f"{issue_path}/{claim_id}/review",
             self.primary_token,
-            {"status": "done", "expected_version": 6},
+            {
+                "action": "approved",
+                "expected_version": 6,
+                "session_id": review_session,
+                "body": "Approved.",
+            },
             key="http-review-approve-0001",
         )
         self.assertEqual(status, 200, approved)
-        self.assertEqual(approved["trusted_metadata"]["status"], "done")
+        self.assertEqual(approved["claim"]["trusted_metadata"]["status"], "done")
+
+        status, detail, _ = self.request(
+            "GET", f"{issue_path}/{claim_id}", self.bob_token
+        )
+        self.assertEqual(status, 200, detail)
+        self.assertEqual(
+            [row["trusted_metadata"]["action"] for row in detail["review_history"]],
+            ["submitted", "changes_requested", "submitted", "approved"],
+        )
 
         status, done, _ = self.request(
             "GET", f"{issue_path}?status=done&assignee=bob", self.alice_token

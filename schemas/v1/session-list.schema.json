@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/psyberone/imitation-krab/schemas/v1/session-list.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["sessions"],
+  "properties": {
+    "sessions": {"type": "array", "items": {"$ref": "session.schema.json"}}
+  }
+}

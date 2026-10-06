@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/psyberone/imitation-krab/schemas/v1/inbox-ack.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["trusted_metadata"],
+  "properties": {
+    "trusted_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["project_key", "acked_through", "updated_at"],
+      "properties": {
+        "project_key": {"type": "string"},
+        "acked_through": {"type": "integer", "minimum": 0},
+        "updated_at": {"type": "string", "format": "date-time"}
+      }
+    }
+  }
+}
