@@ -10,7 +10,8 @@ routing, versions, timestamps, and sequence numbers are under
 | Errors | `v1/error.schema.json` |
 | `projects` | `v1/project-list.schema.json` |
 | `sessions` / `session-create` | `v1/session-list.schema.json`, `v1/session.schema.json` |
-| Claim mutations | `v1/claim.schema.json` |
+| Single-claim mutations | `v1/claim.schema.json` |
+| `claim-import` | `v1/claim-import.schema.json` |
 | `issues` / `prs` | `v1/claim-list.schema.json` |
 | `claim-show` | `v1/claim-detail.schema.json` |
 | `send` / `show` / item status | `v1/item.schema.json` |

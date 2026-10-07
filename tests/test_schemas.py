@@ -22,6 +22,7 @@ class SchemaFileTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1] / "schemas" / "v1"
         expected = {
             "claim-detail.schema.json",
+            "claim-import.schema.json",
             "claim-list.schema.json",
             "claim.schema.json",
             "error.schema.json",
@@ -126,6 +127,14 @@ class ResponseSchemaTests(unittest.TestCase):
         ).payload
         claim_id = claim["trusted_metadata"]["claim_id"]
         self.validate("claim.schema.json", claim)
+        imported = self.service.import_work_claims(
+            self.alice,
+            "project-one",
+            "issue",
+            {"external_ids": ["owner/repository#701", "owner/repository#702"]},
+            "schema-claim-import-0001",
+        ).payload
+        self.validate("claim-import.schema.json", imported)
         self.validate(
             "claim-list.schema.json",
             self.service.list_work_claims(self.bob, "project-one", "issue"),

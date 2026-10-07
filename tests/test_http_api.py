@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import signal
 import socket
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import imitation_krab.http_api as http_api
 from imitation_krab.config import CONTAINER_HOST, DEFAULT_HOST
 from imitation_krab.db import Database
 from imitation_krab.http_api import (
@@ -56,6 +59,68 @@ class StrictJSONTests(unittest.TestCase):
         self.assertTrue(limiter.acquire("bob", 2))
         limiter.release("alice")
         self.assertTrue(limiter.acquire("alice", 2))
+
+    def test_sliding_window_limiter_evicts_expired_and_empty_keys(self) -> None:
+        limiter = SlidingWindowLimiter()
+        with mock.patch.object(http_api.time, "monotonic", return_value=100.0):
+            self.assertTrue(limiter.allow("old-peer", "auth_failure", 30))
+        self.assertIn(("old-peer", "auth_failure"), limiter._entries)
+
+        with mock.patch.object(http_api.time, "monotonic", return_value=161.0):
+            self.assertFalse(limiter.limited("new-peer", "auth_failure", 30))
+
+        self.assertNotIn(("old-peer", "auth_failure"), limiter._entries)
+        self.assertNotIn(("new-peer", "auth_failure"), limiter._entries)
+
+    def test_server_shutdown_signals_are_coordinated_and_restored(self) -> None:
+        self.assertFalse(http_api.KrabHTTPServer.daemon_threads)
+        self.assertTrue(http_api.KrabHTTPServer.block_on_close)
+
+        installed: dict[signal.Signals, object] = {}
+        previous = {signal.SIGINT: object(), signal.SIGTERM: object()}
+
+        class FakeServer:
+            server_address = (DEFAULT_HOST, 8737)
+
+            def __init__(self) -> None:
+                self.shutdown_called = threading.Event()
+                self.closed = False
+
+            def serve_forever(self, *, poll_interval: float) -> None:
+                if poll_interval != 0.25:
+                    raise AssertionError("unexpected server poll interval")
+                handler = installed[signal.SIGTERM]
+                assert callable(handler)
+                handler(signal.SIGTERM, None)
+                if not self.shutdown_called.wait(timeout=1):
+                    raise AssertionError("signal did not request server shutdown")
+
+            def shutdown(self) -> None:
+                self.shutdown_called.set()
+
+            def server_close(self) -> None:
+                self.closed = True
+
+        server = FakeServer()
+
+        def set_signal(signum: signal.Signals, handler: object) -> None:
+            installed[signum] = handler
+
+        with (
+            mock.patch.object(http_api, "make_server", return_value=server),
+            mock.patch.object(
+                http_api.signal,
+                "getsignal",
+                side_effect=lambda signum: previous[signum],
+            ),
+            mock.patch.object(http_api.signal, "signal", side_effect=set_signal),
+        ):
+            http_api.serve(mock.Mock(), port=0)
+
+        self.assertTrue(server.shutdown_called.is_set())
+        self.assertTrue(server.closed)
+        self.assertIs(installed[signal.SIGINT], previous[signal.SIGINT])
+        self.assertIs(installed[signal.SIGTERM], previous[signal.SIGTERM])
 
 
 class HTTPAPITests(unittest.TestCase):

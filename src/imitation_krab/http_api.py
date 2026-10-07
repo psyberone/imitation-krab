@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import heapq
 import json
 import logging
 import secrets
+import signal
 import sqlite3
 import threading
 import time
@@ -72,8 +74,50 @@ def decode_json_object(raw: bytes) -> dict[str, Any]:
 
 class SlidingWindowLimiter:
     def __init__(self) -> None:
-        self._entries: dict[tuple[str, str], deque[float]] = defaultdict(deque)
+        self._entries: dict[tuple[str, str], deque[float]] = {}
+        self._expires_at: dict[tuple[str, str], float] = {}
+        self._expiry_heap: list[tuple[float, tuple[str, str]]] = []
         self._lock = threading.Lock()
+
+    def _evict_expired(self, now: float) -> None:
+        # A heap keeps cleanup proportional to expired keys instead of scanning
+        # every attacker-influenced peer identity on each request.
+        while self._expiry_heap and self._expiry_heap[0][0] <= now:
+            expires_at, key = heapq.heappop(self._expiry_heap)
+            if self._expires_at.get(key) != expires_at:
+                continue
+            self._expires_at.pop(key, None)
+            self._entries.pop(key, None)
+
+    def _active_entries(
+        self,
+        key: tuple[str, str],
+        cutoff: float,
+        window_seconds: int,
+    ) -> deque[float] | None:
+        entries = self._entries.get(key)
+        if entries is None:
+            return None
+        while entries and entries[0] <= cutoff:
+            entries.popleft()
+        if not entries:
+            self._entries.pop(key, None)
+            self._expires_at.pop(key, None)
+            return None
+        expires_at = entries[-1] + window_seconds
+        if self._expires_at.get(key) != expires_at:
+            self._expires_at[key] = expires_at
+            heapq.heappush(self._expiry_heap, (expires_at, key))
+        return entries
+
+    def _set_expiration(
+        self, key: tuple[str, str], entries: deque[float], window_seconds: int
+    ) -> None:
+        expires_at = entries[-1] + window_seconds
+        if self._expires_at.get(key) == expires_at:
+            return
+        self._expires_at[key] = expires_at
+        heapq.heappush(self._expiry_heap, (expires_at, key))
 
     def allow(
         self, subject: str, bucket: str, limit: int, window_seconds: int = 60
@@ -82,12 +126,15 @@ class SlidingWindowLimiter:
         cutoff = now - window_seconds
         key = (subject, bucket)
         with self._lock:
-            entries = self._entries[key]
-            while entries and entries[0] <= cutoff:
-                entries.popleft()
+            self._evict_expired(now)
+            entries = self._active_entries(key, cutoff, window_seconds)
+            if entries is None:
+                entries = deque()
+                self._entries[key] = entries
             if len(entries) >= limit:
                 return False
             entries.append(now)
+            self._set_expiration(key, entries, window_seconds)
             return True
 
     def limited(
@@ -97,10 +144,9 @@ class SlidingWindowLimiter:
         cutoff = now - window_seconds
         key = (subject, bucket)
         with self._lock:
-            entries = self._entries[key]
-            while entries and entries[0] <= cutoff:
-                entries.popleft()
-            return len(entries) >= limit
+            self._evict_expired(now)
+            entries = self._active_entries(key, cutoff, window_seconds)
+            return entries is not None and len(entries) >= limit
 
 
 class ConcurrentLimiter:
@@ -125,7 +171,8 @@ class ConcurrentLimiter:
 
 
 class KrabHTTPServer(ThreadingHTTPServer):
-    daemon_threads = True
+    daemon_threads = False
+    block_on_close = True
     allow_reuse_address = True
     request_queue_size = 64
 
@@ -763,6 +810,58 @@ def make_server(
     return KrabHTTPServer((host, port), database)
 
 
+_ShutdownSignalState = tuple[
+    threading.Event,
+    threading.Thread,
+    dict[signal.Signals, Any],
+]
+
+
+def _install_shutdown_signal_handlers(
+    server: KrabHTTPServer,
+) -> _ShutdownSignalState | None:
+    """Move signal-triggered shutdown off the serve_forever thread."""
+    if threading.current_thread() is not threading.main_thread():
+        return None
+
+    requested = threading.Event()
+
+    def wait_for_shutdown() -> None:
+        requested.wait()
+        server.shutdown()
+
+    waiter = threading.Thread(
+        target=wait_for_shutdown,
+        name="krab-shutdown",
+        daemon=True,
+    )
+
+    def request_shutdown(_signum: int, _frame: Any) -> None:
+        requested.set()
+
+    previous: dict[signal.Signals, Any] = {}
+    try:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, request_shutdown)
+    except Exception:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+        raise
+    waiter.start()
+    return requested, waiter, previous
+
+
+def _restore_shutdown_signal_handlers(state: _ShutdownSignalState | None) -> None:
+    if state is None:
+        return
+    requested, waiter, previous = state
+    requested.set()
+    waiter.join()
+    for signum, handler in previous.items():
+        signal.signal(signum, handler)
+
+
 def serve(
     database: Database,
     host: str = DEFAULT_HOST,
@@ -771,10 +870,12 @@ def serve(
     container_bind: bool = False,
 ) -> None:
     server = make_server(database, host, port, container_bind=container_bind)
+    shutdown_signals = _install_shutdown_signal_handlers(server)
     address = server.server_address[0]
     actual_port = server.server_address[1]
     LOG.info("listening on http://%s:%s", address, actual_port)
     try:
         server.serve_forever(poll_interval=0.25)
     finally:
+        _restore_shutdown_signal_handlers(shutdown_signals)
         server.server_close()

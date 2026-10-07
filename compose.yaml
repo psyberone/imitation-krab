@@ -38,7 +38,7 @@ services:
       - --port
       - "8765"
     restart: unless-stopped
-    stop_grace_period: 15s
+    stop_grace_period: 60s
     ports:
       - name: api
         target: 8765
