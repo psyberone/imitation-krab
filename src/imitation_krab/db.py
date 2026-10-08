@@ -18,7 +18,7 @@ from .config import MAX_DATABASE_BYTES, default_db_path, default_pepper_path
 from .sanitize import sanitize_text, validate_handle, validate_project_key
 
 TOKEN_RE = re.compile(r"^krab_(usr_[0-9a-f]{32})_([A-Za-z0-9_-]{43})$")
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 SCHEMA = """
@@ -229,6 +229,8 @@ CREATE INDEX IF NOT EXISTS idx_work_claims_assignee
     ON work_claims(assignee_id, project_id, status);
 CREATE INDEX IF NOT EXISTS idx_events_item
     ON events(item_id, seq);
+CREATE INDEX IF NOT EXISTS idx_events_project_seq
+    ON events(project_id, seq);
 CREATE INDEX IF NOT EXISTS idx_deliveries_user_event
     ON deliveries(user_id, event_seq);
 CREATE INDEX IF NOT EXISTS idx_audit_action_target
@@ -401,6 +403,14 @@ MIGRATION_4_TO_5 = (
 )
 
 
+MIGRATION_5_TO_6 = (
+    """
+    CREATE INDEX idx_events_project_seq
+        ON events(project_id, seq)
+    """,
+)
+
+
 class DatabaseError(RuntimeError):
     pass
 
@@ -495,7 +505,7 @@ class Database:
         version = rows[0]["version"]
         if version == SCHEMA_VERSION:
             return
-        if version not in {1, 2, 3, 4}:
+        if version not in {1, 2, 3, 4, 5}:
             raise DatabaseError("unsupported database schema version")
 
         try:
@@ -504,7 +514,7 @@ class Database:
             if len(locked_rows) != 1:
                 raise DatabaseError("database schema metadata is invalid")
             locked_version = locked_rows[0]["version"]
-            if locked_version not in {1, 2, 3, 4, SCHEMA_VERSION}:
+            if locked_version not in {1, 2, 3, 4, 5, SCHEMA_VERSION}:
                 raise DatabaseError("unsupported database schema version")
             if locked_version == 1:
                 for statement in MIGRATION_1_TO_2:
@@ -546,8 +556,13 @@ class Database:
                               AND action = 'work_claim.submitted'
                         )
                         """)
+                conn.execute("UPDATE schema_meta SET version = 5 WHERE version = 4")
+                locked_version = 5
+            if locked_version == 5:
+                for statement in MIGRATION_5_TO_6:
+                    conn.execute(statement)
                 conn.execute(
-                    "UPDATE schema_meta SET version = ? WHERE version = 4",
+                    "UPDATE schema_meta SET version = ? WHERE version = 5",
                     (SCHEMA_VERSION,),
                 )
             conn.commit()
@@ -723,6 +738,112 @@ class Database:
             raise
         finally:
             conn.close()
+
+    def list_users(self) -> dict[str, Any]:
+        conn = self.connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT id, handle, active, token_version, created_at, updated_at
+                FROM users
+                ORDER BY handle
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+        return {
+            "users": [
+                {
+                    "trusted_metadata": {
+                        "user_id": row["id"],
+                        "handle": row["handle"],
+                        "active": bool(row["active"]),
+                        "token_version": row["token_version"],
+                        "created_at": row["created_at"],
+                        "updated_at": row["updated_at"],
+                    }
+                }
+                for row in rows
+            ]
+        }
+
+    def list_projects_inventory(self) -> dict[str, Any]:
+        conn = self.connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT id, project_key, label, created_at
+                FROM projects
+                ORDER BY project_key
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+        return {
+            "projects": [
+                {
+                    "trusted_metadata": {
+                        "project_id": row["id"],
+                        "project_key": row["project_key"],
+                        "created_at": row["created_at"],
+                    },
+                    "untrusted_text": {"label": row["label"]},
+                }
+                for row in rows
+            ]
+        }
+
+    def list_project_members(self, project_key: str) -> dict[str, Any]:
+        project_key = validate_project_key(project_key)
+        conn = self.connect()
+        try:
+            project = conn.execute(
+                "SELECT id, project_key, label FROM projects WHERE project_key = ?",
+                (project_key,),
+            ).fetchone()
+            if project is None:
+                raise DatabaseError("project not found")
+            rows = conn.execute(
+                """
+                SELECT
+                    u.id, u.handle, u.active, u.token_version,
+                    pm.created_at AS member_since,
+                    CASE
+                        WHEN pm.role = 'admin' THEN 'admin'
+                        WHEN pc.user_id IS NOT NULL THEN 'coordinator'
+                        ELSE 'member'
+                    END AS role
+                FROM project_members pm
+                JOIN users u ON u.id = pm.user_id
+                LEFT JOIN project_coordinators pc
+                  ON pc.project_id = pm.project_id AND pc.user_id = pm.user_id
+                WHERE pm.project_id = ?
+                ORDER BY u.handle
+                """,
+                (project["id"],),
+            ).fetchall()
+        finally:
+            conn.close()
+        return {
+            "trusted_metadata": {
+                "project_id": project["id"],
+                "project_key": project["project_key"],
+            },
+            "untrusted_text": {"label": project["label"]},
+            "members": [
+                {
+                    "trusted_metadata": {
+                        "user_id": row["id"],
+                        "handle": row["handle"],
+                        "active": bool(row["active"]),
+                        "role": row["role"],
+                        "token_version": row["token_version"],
+                        "member_since": row["member_since"],
+                    }
+                }
+                for row in rows
+            ],
+        }
 
     def create_project(self, project_key: str, label: str) -> dict[str, Any]:
         project_key = validate_project_key(project_key)

@@ -7,8 +7,10 @@ agent runtime.
 Each user has one server-generated bearer token and private deliveries. Every
 work item belongs to exactly one project and one session. Users can read one
 session queue or their project-wide inbox, update work through a fixed status
-machine, and send a bodyless reminder. They cannot inspect another user’s
-deliveries or open a peer-to-peer connection.
+machine, and send a bodyless reminder. Active project members can also read a
+minimal project activity feed containing trusted event metadata and untrusted
+work-item titles. They cannot inspect another user’s bodies, notes, verdict
+prose, message history, or open a peer-to-peer connection.
 
 Each project also has two shared claim queues: issues and pull requests. They
 are filtered views over one small local registry, not GitHub integration.
@@ -147,7 +149,7 @@ docker compose ps
 curl --fail --silent http://127.0.0.1:8765/v1/health
 ```
 
-New images migrate an existing schema 1 through 4 database to schema 5 at
+New images migrate an existing schema 1 through 5 database to schema 6 at
 startup without deleting users, projects, sessions, messages, or claims. Take
 a verified backup before updating, then rebuild and recreate the service
 container:
@@ -208,6 +210,20 @@ krab admin project-add-user imitation-krab owner --role admin
 krab admin project-add-user imitation-krab primary-dev --role coordinator
 krab admin project-add-user imitation-krab worker-one --role member
 ```
+
+Local operators and orchestrators can reconcile the existing state without
+opening the SQLite database directly:
+
+```console
+krab --json admin user-list
+krab --json admin project-list
+krab --json admin project-members imitation-krab
+```
+
+These read-only commands include stable identifiers, handles, active state,
+roles, and token versions where applicable. They never return bearer tokens or
+token digests. Identity and membership mutations remain local-only; there is
+no administrative HTTP API.
 
 Token files are created with mode `0600`. The CLI refuses symlinked or
 hard-linked token files, non-owned files, group/world-accessible files, and
@@ -297,6 +313,51 @@ agent is busy, disconnected, rate-limited, or gone.
 
 Console output escapes terminal controls and labels every user-controlled field
 as content. Add the global `--json` option for machine-readable output.
+
+## External orchestrator integration
+
+An authenticated client can discover the stable Krab identity behind its
+rotatable credential with `GET /v1/whoami`. It returns:
+
+```json
+{
+  "trusted_metadata": {
+    "user_id": "usr_...",
+    "handle": "worker-one",
+    "token_version": 1
+  }
+}
+```
+
+The returned `user_id` is the identity link. A bearer token is credential
+material and must not be used as an application identity key or accepted as a
+login credential by an external orchestrator.
+
+Every active project member can consume a project-visible activity feed:
+
+```text
+GET /v1/projects/imitation-krab/activity?after=0&limit=50&wait=30
+```
+
+The feed is ordered by server event sequence, uses the same 100-event page and
+30-second wait caps as private queues, and has no acknowledgement state. A
+consumer persists `next_cursor` only after transactionally processing the
+returned page. Events contain actor, creator, recipient, session, item status,
+version, and an immutable claim link when present. Members, coordinators, and
+admins receive the same activity shape; elevated project roles do not reveal
+private content.
+
+A work-item title is visible to all active members of its project. Bodies,
+notes, verdict prose, and history remain visible only through existing
+participant-authorized endpoints. Activity responses do not include content
+risk flags because existing flags may combine signals from private bodies or
+notes. Titles remain untrusted text.
+
+Krab does not store repository paths, agent profiles, execution configuration,
+credentials for other systems, or an orchestrator's runtime state. The claim
+registry remains the authoritative Krab source for opaque external ID, kind,
+status, assignee, version, and review round; an external orchestrator performs
+any GitHub or GitLab correlation itself.
 
 ## Claim issues and pull requests
 
@@ -495,7 +556,9 @@ uncertain response, its error prints the exact global `--idempotency-key` to
 use for a safe retry. Reusing a key with different content is rejected.
 
 ```text
+GET   /v1/whoami
 GET   /v1/projects
+GET   /v1/projects/{project}/activity?after=0&limit=50&wait=30
 GET   /v1/projects/{project}/issues?status=under_review&assignee=worker-one
 POST  /v1/projects/{project}/issues
 POST  /v1/projects/{project}/issues/import
@@ -531,10 +594,10 @@ POST  /v1/projects/{project}/sessions/{session}/items/{item}/notify
 GET   /v1/projects/{project}/sessions/{session}/queue?after=0&limit=50&wait=30
 ```
 
-Session queue cursors are caller supplied. The project inbox additionally has
-an explicit durable cursor per authenticated user and project. Long-poll waits
-are capped at 30 seconds and two concurrent waits per user. A reminder has no
-text body and is throttled.
+Session queue and project activity cursors are caller supplied. The project
+inbox additionally has an explicit durable cursor per authenticated user and
+project. Long-poll waits are capped at 30 seconds and two concurrent waits per
+user across these endpoints. A reminder has no text body and is throttled.
 
 Responses keep provenance separate from content:
 
@@ -596,3 +659,10 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 The suite exercises the service and complete HTTP handler through local socket
 pairs, so it does not require permission to bind a network port.
+
+Coverage is measured with branch tracking and must remain at or above 85%:
+
+```console
+PYTHONPATH=src python3 -m coverage run -m unittest discover -s tests
+python3 -m coverage report
+```

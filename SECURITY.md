@@ -47,6 +47,10 @@ the raw bearer token in model context.
 15. A project inbox is a union only of deliveries addressed to the authenticated
     user. Durable acknowledgement is explicit, monotonic, and cannot advance
     beyond that user's delivered events in the project.
+16. Project activity is visible only to active members of that project and is
+    produced by an allowlist serializer that selects event metadata and the
+    immutable title, but never selects bodies, notes, verdict prose, history,
+    transcripts, or content risk flags.
 
 ## Trust boundaries
 
@@ -68,12 +72,26 @@ coordinators may populate and manage the project claim queue, and admins retain
 the coordinator capabilities plus administrative override. Identity,
 membership, and role changes remain unavailable over HTTP.
 
+`GET /v1/whoami` returns the authenticated user's stable ID, validated handle,
+and current token version. It never returns bearer material or a stored digest.
+Consumers must key identity relationships by `user_id`, not by the rotatable
+bearer token. A Krab bearer token authenticates only to Krab and must not be
+accepted as a user login credential by an external orchestrator.
+
 ### Untrusted content
 
 Project and session labels, titles, bodies, notes, and result summaries remain
 untrusted even when an authenticated user supplied them. API responses place
 them under `untrusted_text`; consumers must not merge them into a system or
 developer instruction channel.
+
+A work-item title is visible to all active members of its project. Bodies,
+notes, verdict prose, and history remain visible only through existing
+participant-authorized endpoints.
+
+The project activity serializer does not return risk flags. Item and event flags
+can combine signals from a title with signals from private bodies or notes, so
+returning the combined values would disclose information about private content.
 
 External work identifiers are not prose fields, but they are still supplied by
 project coordinators/admins and are not externally verified. Consumers must
@@ -109,6 +127,7 @@ content.
 | Malicious external identifier | Restricted ASCII and length, opaque-reference semantics, no URL parsing/fetching, and no external action |
 | Retry duplication or replay confusion | Required idempotency keys bound to actor, operation, and request hash |
 | Cross-session inbox disclosure | Project membership plus authenticated-user delivery rows and session-membership joins; no project-wide broadcast rows |
+| Project activity overexposure | Active project-membership check, explicit SQL column selection, dedicated allowlist serializer, title-only untrusted text, no delivery body/note/history/risk fields |
 | Lost or forged read position | Explicit per-user/project monotonic acknowledgement bounded by the highest event delivered to that same user |
 | Queue flooding | Request throttles, per-user long-poll concurrency, participant/session/event limits, message-size limits, per-route open-item cap, and database-size cap |
 | Terminal/log injection | Dangerous controls rejected on ingress; console escapes again on output; structured logs omit bodies |
@@ -197,6 +216,10 @@ checks limit other users' data, not that user's own blast radius.
 - Project inbox delivery and acknowledgement are not presence. The service has
   no heartbeat and cannot distinguish a working, disconnected, paused,
   rate-limited, or dead agent.
+- Project members can see the title and routing metadata of every work-item
+  event in their project, including sessions they do not participate in. Keep
+  private prose and secrets out of titles; use bodies and notes for content that
+  should remain participant-scoped.
 - Acknowledgement means only that a client explicitly advanced its Krab cursor;
   it does not prove that an agent understood, accepted, or completed the work.
 - There is no automatic retention or archive operation. The 256 MiB database

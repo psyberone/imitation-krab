@@ -193,9 +193,15 @@ def build_parser() -> argparse.ArgumentParser:
     user_rotate.add_argument("--write-token", type=Path)
     user_disable = admin_sub.add_parser("user-disable")
     user_disable.add_argument("handle")
+    admin_sub.add_parser("user-list", help="list local identities without credentials")
     project_create = admin_sub.add_parser("project-create")
     project_create.add_argument("key")
     project_create.add_argument("--label", required=True)
+    admin_sub.add_parser("project-list", help="list all local projects")
+    project_members = admin_sub.add_parser(
+        "project-members", help="list local project membership"
+    )
+    project_members.add_argument("project")
     project_member = admin_sub.add_parser("project-add-user")
     project_member.add_argument("project")
     project_member.add_argument("handle")
@@ -422,8 +428,14 @@ def _run_admin(args: argparse.Namespace, database: Database) -> int:
         _emit_token_result(args, user, token, args.write_token, replace=True)
     elif command == "user-disable":
         _emit(args, database.disable_user(args.handle))
+    elif command == "user-list":
+        _emit(args, database.list_users())
     elif command == "project-create":
         _emit(args, database.create_project(args.key, args.label))
+    elif command == "project-list":
+        _emit(args, database.list_projects_inventory())
+    elif command == "project-members":
+        _emit(args, database.list_project_members(args.project))
     elif command == "project-add-user":
         _emit(
             args,

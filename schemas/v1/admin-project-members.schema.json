@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/psyberone/imitation-krab/schemas/v1/admin-project-members.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["trusted_metadata", "untrusted_text", "members"],
+  "properties": {
+    "trusted_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["project_id", "project_key"],
+      "properties": {
+        "project_id": {"type": "string", "pattern": "^prj_[0-9a-f]{32}$"},
+        "project_key": {"type": "string"}
+      }
+    },
+    "untrusted_text": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["label"],
+      "properties": {"label": {"type": "string"}}
+    },
+    "members": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["trusted_metadata"],
+        "properties": {
+          "trusted_metadata": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "user_id", "handle", "active", "role", "token_version", "member_since"
+            ],
+            "properties": {
+              "user_id": {"type": "string", "pattern": "^usr_[0-9a-f]{32}$"},
+              "handle": {"type": "string"},
+              "active": {"type": "boolean"},
+              "role": {"enum": ["member", "coordinator", "admin"]},
+              "token_version": {"type": "integer", "minimum": 1},
+              "member_since": {"type": "string", "format": "date-time"}
+            }
+          }
+        }
+      }
+    }
+  }
+}

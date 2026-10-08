@@ -21,6 +21,10 @@ class SchemaFileTests(unittest.TestCase):
     def test_schema_catalog_is_parseable_and_all_local_refs_exist(self) -> None:
         root = Path(__file__).resolve().parents[1] / "schemas" / "v1"
         expected = {
+            "activity.schema.json",
+            "admin-project-list.schema.json",
+            "admin-project-members.schema.json",
+            "admin-user-list.schema.json",
             "claim-detail.schema.json",
             "claim-import.schema.json",
             "claim-list.schema.json",
@@ -34,6 +38,7 @@ class SchemaFileTests(unittest.TestCase):
             "review-result.schema.json",
             "session-list.schema.json",
             "session.schema.json",
+            "whoami.schema.json",
         }
         self.assertEqual({path.name for path in root.glob("*.json")}, expected)
 
@@ -101,8 +106,17 @@ class ResponseSchemaTests(unittest.TestCase):
         Draft202012Validator(schema, registry=self.registry).validate(instance)
 
     def test_live_service_responses_match_the_catalog(self) -> None:
+        self.validate("whoami.schema.json", self.service.whoami(self.alice))
         self.validate(
             "project-list.schema.json", self.service.list_projects(self.alice)
+        )
+        self.validate("admin-user-list.schema.json", self.db.list_users())
+        self.validate(
+            "admin-project-list.schema.json", self.db.list_projects_inventory()
+        )
+        self.validate(
+            "admin-project-members.schema.json",
+            self.db.list_project_members("project-one"),
         )
 
         session = self.service.create_session(
@@ -166,6 +180,10 @@ class ResponseSchemaTests(unittest.TestCase):
         self.validate(
             "queue.schema.json",
             self.service.get_project_inbox(self.bob, "project-one"),
+        )
+        self.validate(
+            "activity.schema.json",
+            self.service.get_project_activity(self.bob, "project-one"),
         )
 
         self.service.claim_work(

@@ -332,6 +332,9 @@ class KrabRequestHandler(BaseHTTPRequestHandler):
     def _route_get(
         self, actor: dict[str, Any], path: list[str], query: dict[str, list[str]]
     ) -> tuple[int, dict[str, Any]]:
+        if path == ["v1", "whoami"]:
+            self._require_query(query, set())
+            return 200, self.server.service.whoami(actor)
         if path == ["v1", "projects"]:
             self._require_query(query, set())
             return 200, self.server.service.list_projects(actor)
@@ -360,7 +363,42 @@ class KrabRequestHandler(BaseHTTPRequestHandler):
                 CLAIM_QUEUE_KINDS[path[3]],
                 path[4],
             )
-        if len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "inbox":
+        if (
+            len(path) == 4
+            and path[:2] == ["v1", "projects"]
+            and path[3] == "activity"
+        ):
+            self._require_query(query, {"after", "limit", "wait"})
+            after = self._query_int(query, "after", 0)
+            limit = self._query_int(query, "limit", 50)
+            wait = self._query_int(query, "wait", 0)
+            acquired = False
+            if wait:
+                acquired = self.server.long_polls.acquire(
+                    actor["id"], MAX_LONG_POLLS_PER_USER
+                )
+                if not acquired:
+                    raise ServiceError(
+                        429,
+                        "long_poll_limit",
+                        "too many concurrent long polls for this user",
+                    )
+            try:
+                return 200, self.server.service.get_project_activity(
+                    actor,
+                    path[2],
+                    after=after,
+                    limit=limit,
+                    wait=wait,
+                )
+            finally:
+                if acquired:
+                    self.server.long_polls.release(actor["id"])
+        if (
+            len(path) == 4
+            and path[:2] == ["v1", "projects"]
+            and path[3] == "inbox"
+        ):
             self._require_query(query, {"after", "limit", "wait", "unread"})
             unread = self._query_bool(query, "unread", False)
             after = (

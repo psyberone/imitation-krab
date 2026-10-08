@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "imitation-krab"
-version = "0.5.1"
+version = "0.6.0"
 description = "A local, scoped work mailbox for cooperating software agents"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -24,3 +24,12 @@ where = ["src"]
 [tool.setuptools.data-files]
 "share/imitation-krab/schemas" = ["schemas/README.md"]
 "share/imitation-krab/schemas/v1" = ["schemas/v1/*.schema.json"]
+
+[tool.coverage.run]
+branch = true
+source = ["imitation_krab"]
+
+[tool.coverage.report]
+fail_under = 85
+precision = 1
+show_missing = true

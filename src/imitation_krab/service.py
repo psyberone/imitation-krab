@@ -98,6 +98,16 @@ class Service:
     def __init__(self, database: Database):
         self.db = database
 
+    @staticmethod
+    def whoami(actor: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "trusted_metadata": {
+                "user_id": actor["id"],
+                "handle": actor["handle"],
+                "token_version": actor["token_version"],
+            }
+        }
+
     def list_projects(self, actor: dict[str, Any]) -> dict[str, Any]:
         conn = self.db.connect()
         try:
@@ -1850,6 +1860,99 @@ class Service:
             "events": [self._serialize_queue_event(row, project_key) for row in rows],
         }
 
+    def get_project_activity(
+        self,
+        actor: dict[str, Any],
+        project_key: str,
+        *,
+        after: int = 0,
+        limit: int = 50,
+        wait: int = 0,
+    ) -> dict[str, Any]:
+        project_key = self._valid_project_key(project_key)
+        if isinstance(after, bool) or not isinstance(after, int) or after < 0:
+            raise ServiceError(
+                400, "invalid_cursor", "after must be a non-negative integer"
+            )
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= MAX_QUEUE_LIMIT
+        ):
+            raise ServiceError(
+                400, "invalid_limit", f"limit must be between 1 and {MAX_QUEUE_LIMIT}"
+            )
+        if (
+            isinstance(wait, bool)
+            or not isinstance(wait, int)
+            or not 0 <= wait <= MAX_LONG_POLL_SECONDS
+        ):
+            raise ServiceError(
+                400,
+                "invalid_wait",
+                f"wait must be between 0 and {MAX_LONG_POLL_SECONDS}",
+            )
+
+        deadline = time.monotonic() + wait
+        rows: list[sqlite3.Row] = []
+        while True:
+            conn = self.db.connect()
+            try:
+                project = self._project_membership(conn, actor["id"], project_key)
+                rows = conn.execute(
+                    """
+                    SELECT
+                        e.seq,
+                        e.session_id,
+                        e.item_id,
+                        e.actor_id,
+                        e.kind,
+                        e.from_status,
+                        e.to_status,
+                        e.created_at,
+                        i.title,
+                        i.status AS current_status,
+                        i.version,
+                        i.work_claim_id,
+                        wc.kind AS work_claim_kind,
+                        wc.external_id AS work_claim_external_id,
+                        creator.id AS creator_id,
+                        creator.handle AS creator_handle,
+                        recipient.id AS recipient_id,
+                        recipient.handle AS recipient_handle,
+                        event_actor.handle AS actor_handle
+                    FROM events e
+                    JOIN items i
+                      ON i.project_id = e.project_id
+                     AND i.session_id = e.session_id
+                     AND i.id = e.item_id
+                    JOIN users creator ON creator.id = i.creator_id
+                    JOIN users recipient ON recipient.id = i.recipient_id
+                    JOIN users event_actor ON event_actor.id = e.actor_id
+                    LEFT JOIN work_claims wc ON wc.id = i.work_claim_id
+                    WHERE e.project_id = ? AND e.seq > ?
+                    ORDER BY e.seq
+                    LIMIT ?
+                    """,
+                    (project["id"], after, limit),
+                ).fetchall()
+            finally:
+                conn.close()
+            if rows or time.monotonic() >= deadline:
+                break
+            time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+
+        return {
+            "trusted_metadata": {
+                "project_key": project_key,
+                "after": after,
+                "next_cursor": rows[-1]["seq"] if rows else after,
+            },
+            "events": [
+                self._serialize_activity_event(row, project_key) for row in rows
+            ],
+        }
+
     def ack_project_inbox(
         self,
         actor: dict[str, Any],
@@ -2394,6 +2497,39 @@ class Service:
             },
             "untrusted_text": text,
             "content_risk_flags": json.loads(row["risk_flags"]),
+        }
+
+    @staticmethod
+    def _serialize_activity_event(
+        row: sqlite3.Row, project_key: str
+    ) -> dict[str, Any]:
+        return {
+            "trusted_metadata": {
+                "event_seq": row["seq"],
+                "kind": row["kind"],
+                "project_key": project_key,
+                "session_id": row["session_id"],
+                "item_id": row["item_id"],
+                "actor": {
+                    "user_id": row["actor_id"],
+                    "handle": row["actor_handle"],
+                },
+                "creator": {
+                    "user_id": row["creator_id"],
+                    "handle": row["creator_handle"],
+                },
+                "recipient": {
+                    "user_id": row["recipient_id"],
+                    "handle": row["recipient_handle"],
+                },
+                "work_claim": Service._linked_work_metadata(row),
+                "from_status": row["from_status"],
+                "to_status": row["to_status"],
+                "current_status": row["current_status"],
+                "version": row["version"],
+                "created_at": row["created_at"],
+            },
+            "untrusted_text": {"title": row["title"]},
         }
 
     @staticmethod

@@ -120,6 +120,44 @@
         "content_risk_flags": {"$ref": "#/$defs/risk_flags"}
       }
     },
+    "activity_event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trusted_metadata", "untrusted_text"],
+      "properties": {
+        "trusted_metadata": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "event_seq", "kind", "project_key", "session_id", "item_id", "actor",
+            "creator", "recipient", "work_claim", "from_status", "to_status",
+            "current_status", "version", "created_at"
+          ],
+          "properties": {
+            "event_seq": {"type": "integer", "minimum": 1},
+            "kind": {"enum": ["item.created", "status.changed", "item.reminded"]},
+            "project_key": {"type": "string"},
+            "session_id": {"type": "string", "pattern": "^ses_[0-9a-f]{32}$"},
+            "item_id": {"type": "string", "pattern": "^itm_[0-9a-f]{32}$"},
+            "actor": {"$ref": "#/$defs/user"},
+            "creator": {"$ref": "#/$defs/user"},
+            "recipient": {"$ref": "#/$defs/user"},
+            "work_claim": {"$ref": "#/$defs/work_claim_link"},
+            "from_status": {"$ref": "#/$defs/nullable_item_status"},
+            "to_status": {"$ref": "#/$defs/nullable_item_status"},
+            "current_status": {"$ref": "#/$defs/item_status"},
+            "version": {"type": "integer", "minimum": 1},
+            "created_at": {"type": "string", "format": "date-time"}
+          }
+        },
+        "untrusted_text": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["title"],
+          "properties": {"title": {"type": "string"}}
+        }
+      }
+    },
     "history_event": {
       "type": "object",
       "additionalProperties": false,

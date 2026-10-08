@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/psyberone/imitation-krab/schemas/v1/whoami.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["trusted_metadata"],
+  "properties": {
+    "trusted_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["user_id", "handle", "token_version"],
+      "properties": {
+        "user_id": {"type": "string", "pattern": "^usr_[0-9a-f]{32}$"},
+        "handle": {"type": "string"},
+        "token_version": {"type": "integer", "minimum": 1}
+      }
+    }
+  }
+}

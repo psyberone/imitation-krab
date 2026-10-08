@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
 
-from imitation_krab.db import Database
+from imitation_krab.db import SCHEMA_VERSION, Database
 from imitation_krab.service import Service, ServiceError
 
 
@@ -407,7 +407,42 @@ class V050ServiceTests(unittest.TestCase):
 
 
 class V050MigrationTests(unittest.TestCase):
-    def test_v4_database_migrates_to_v5_without_rewriting_claims(self) -> None:
+    def test_v5_database_adds_project_activity_index_without_rewriting_events(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "legacy-v5.db"
+            with closing(sqlite3.connect(path)) as conn:
+                conn.executescript("""
+                    CREATE TABLE schema_meta (version INTEGER NOT NULL);
+                    INSERT INTO schema_meta(version) VALUES (5);
+                    CREATE TABLE events (
+                        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                        project_id TEXT NOT NULL
+                    );
+                    INSERT INTO events(project_id) VALUES ('prj_legacy');
+                    """)
+                conn.commit()
+            path.chmod(0o600)
+
+            database = Database(path, root / "pepper.key")
+            database.initialize()
+            with closing(database.connect()) as conn:
+                self.assertEqual(
+                    conn.execute("SELECT version FROM schema_meta").fetchone()[0],
+                    SCHEMA_VERSION,
+                )
+                self.assertEqual(
+                    conn.execute("SELECT project_id FROM events").fetchone()[0],
+                    "prj_legacy",
+                )
+                self.assertIsNotNone(
+                    conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'index' "
+                        "AND name = 'idx_events_project_seq'"
+                    ).fetchone()
+                )
+
+    def test_v4_database_migrates_to_current_without_rewriting_claims(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             path = root / "legacy-v4.db"
@@ -459,6 +494,10 @@ class V050MigrationTests(unittest.TestCase):
                         details_json TEXT NOT NULL,
                         created_at TEXT NOT NULL
                     );
+                    CREATE TABLE events (
+                        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                        project_id TEXT NOT NULL
+                    );
                     INSERT INTO audit_log(
                         actor_user_id, action, target, details_json, created_at
                     ) VALUES
@@ -478,7 +517,8 @@ class V050MigrationTests(unittest.TestCase):
             database.initialize()
             with closing(database.connect()) as conn:
                 self.assertEqual(
-                    conn.execute("SELECT version FROM schema_meta").fetchone()[0], 5
+                    conn.execute("SELECT version FROM schema_meta").fetchone()[0],
+                    SCHEMA_VERSION,
                 )
                 claim = conn.execute(
                     "SELECT status, version, review_round FROM work_claims"
@@ -490,6 +530,12 @@ class V050MigrationTests(unittest.TestCase):
                     conn.execute(
                         "SELECT name FROM sqlite_master WHERE type = 'table' "
                         "AND name = 'project_inbox_cursors'"
+                    ).fetchone()
+                )
+                self.assertIsNotNone(
+                    conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'index' "
+                        "AND name = 'idx_events_project_seq'"
                     ).fetchone()
                 )
                 self.assertEqual(

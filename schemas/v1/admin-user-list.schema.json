@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/psyberone/imitation-krab/schemas/v1/admin-user-list.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["users"],
+  "properties": {
+    "users": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["trusted_metadata"],
+        "properties": {
+          "trusted_metadata": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "user_id", "handle", "active", "token_version", "created_at", "updated_at"
+            ],
+            "properties": {
+              "user_id": {"type": "string", "pattern": "^usr_[0-9a-f]{32}$"},
+              "handle": {"type": "string"},
+              "active": {"type": "boolean"},
+              "token_version": {"type": "integer", "minimum": 1},
+              "created_at": {"type": "string", "format": "date-time"},
+              "updated_at": {"type": "string", "format": "date-time"}
+            }
+          }
+        }
+      }
+    }
+  }
+}
