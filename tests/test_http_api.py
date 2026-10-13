@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 import imitation_krab.http_api as http_api
+from imitation_krab import __version__
 from imitation_krab.config import CONTAINER_HOST, DEFAULT_HOST
 from imitation_krab.db import Database
 from imitation_krab.http_api import (
@@ -233,6 +234,11 @@ class HTTPAPITests(unittest.TestCase):
         self.assertEqual(status, 401)
         self.assertEqual(data["error"]["code"], "unauthorized")
         self.assertEqual(headers["cache-control"], "no-store")
+        self.assertEqual(headers["x-krab-version"], __version__)
+
+        status, health, health_headers = self.request("GET", "/v1/health", None)
+        self.assertEqual((status, health), (200, {"status": "ok"}))
+        self.assertEqual(health_headers["x-krab-version"], __version__)
 
     def test_whoami_returns_stable_identity_across_credential_rotation(self) -> None:
         status, discovered, _ = self.request("GET", "/v1/whoami", self.alice_token)
@@ -453,6 +459,47 @@ class HTTPAPITests(unittest.TestCase):
         )
         self.assertEqual(status, 400)
         self.assertEqual(data["error"]["code"], "validation_error")
+
+    def test_http_private_queue_latest_is_bounded_and_cannot_long_poll(self) -> None:
+        session_id = self.create_session()
+        item_path = f"/v1/projects/project-one/sessions/{session_id}/items"
+        sequences = []
+        for number in range(3):
+            status, created, _ = self.request(
+                "POST",
+                item_path,
+                self.alice_token,
+                {"to": "bob", "title": f"Item {number}", "body": f"Body {number}"},
+                key=f"http-latest-item-{number:04d}",
+            )
+            self.assertEqual(status, 201, created)
+            sequences.append(created["trusted_metadata"]["event_seq"])
+
+        status, latest, _ = self.request(
+            "GET",
+            f"/v1/projects/project-one/sessions/{session_id}/queue?latest=1&limit=2",
+            self.bob_token,
+        )
+        self.assertEqual(status, 200, latest)
+        self.assertEqual(
+            [event["trusted_metadata"]["event_seq"] for event in latest["events"]],
+            sequences[-2:],
+        )
+        self.assertTrue(latest["trusted_metadata"]["latest"])
+
+        for query, code in (
+            ("latest=2", "invalid_query"),
+            ("latest=1&after=1", "invalid_latest"),
+            ("latest=1&wait=1", "invalid_latest"),
+        ):
+            with self.subTest(query=query):
+                status, invalid, _ = self.request(
+                    "GET",
+                    f"/v1/projects/project-one/sessions/{session_id}/queue?{query}",
+                    self.bob_token,
+                )
+                self.assertEqual(status, 400, invalid)
+                self.assertEqual(invalid["error"]["code"], code)
 
     def test_http_claim_queues_and_message_link(self) -> None:
         issue_path = "/v1/projects/project-one/issues"

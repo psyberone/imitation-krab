@@ -13,6 +13,7 @@
         "session_id": {"type": "string", "pattern": "^ses_[0-9a-f]{32}$"},
         "after": {"type": "integer", "minimum": 0},
         "next_cursor": {"type": "integer", "minimum": 0},
+        "latest": {"const": true},
         "acked_through": {"type": "integer", "minimum": 0},
         "unread": {"type": "boolean"}
       },

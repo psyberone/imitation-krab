@@ -128,6 +128,45 @@ class SanitizeTests(unittest.TestCase):
         )
         self.assertEqual(send.claim, "clm_" + "b" * 32)
 
+        retry = build_parser().parse_args(
+            [
+                "send",
+                "--project",
+                "project-one",
+                "--session",
+                "ses_" + "a" * 32,
+                "--to",
+                "bob",
+                "--title",
+                "Review",
+                "--body",
+                "Please review",
+                "--idempotency-key",
+                "stable-retry-key",
+            ]
+        )
+        self.assertEqual(retry.idempotency_key, "stable-retry-key")
+
+        mine = build_parser().parse_args(
+            ["claims", "--project", "project-one", "--mine"]
+        )
+        self.assertTrue(mine.mine)
+
+        latest = build_parser().parse_args(
+            [
+                "queue",
+                "--project",
+                "project-one",
+                "--session",
+                "ses_" + "a" * 32,
+                "--latest",
+                "--limit",
+                "10",
+            ]
+        )
+        self.assertTrue(latest.latest)
+        self.assertIsNone(latest.after)
+
         review = build_parser().parse_args(
             [
                 "claim-status",

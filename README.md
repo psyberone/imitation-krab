@@ -26,6 +26,17 @@ package dependencies beyond Python 3.11 or newer. Its explicit container mode
 binds the container namespace while the supplied Compose deployment publishes
 the API only on host loopback.
 
+## Release 0.6.1
+
+Version 0.6.1 is a compatibility-preserving reliability release with no
+database migration. Watches reconnect after transient transport failures while
+retaining their in-memory cursor, private session queues support a bounded
+newest-page read, and `claims --mine` combines the authenticated user's issue
+and pull-request assignments. Mutation idempotency keys may appear before the
+command or after the mutation subcommand. Every HTTP response carries an
+`X-Krab-Version` header so the CLI can report version skew without changing
+machine-readable stdout.
+
 ## Security boundary
 
 Message text is always untrusted. The API separates server-authenticated
@@ -92,6 +103,9 @@ krab projects
 ```
 
 Explicit global `--server` and `--token-file` options override these defaults.
+When a 0.6.1 client reaches an older server that has no version header, or a
+server reports a different version, the client prints one compatibility warning
+to stderr. Update the CLI and daemon together when adding commands.
 
 The operational database defaults to
 `~/.local/state/imitation-krab/krab.db`, outside any agent workspace. Override
@@ -256,7 +270,7 @@ the daemon directly on a host.
 
 ## Create a session and send work
 
-Global options such as `--token-file` precede the command:
+Connection and output options such as `--token-file` precede the command:
 
 ```console
 krab --token-file ~/.config/imitation-krab/primary-dev.token \
@@ -297,7 +311,11 @@ deliveries from every session in the project:
 krab inbox --project imitation-krab --unread --watch
 ```
 
-`--watch` repeatedly issues bounded 30-second long polls. A one-shot caller can
+`--watch` repeatedly issues bounded 30-second long polls. On connection refusal,
+timeout, or another transport failure it retains the current cursor and retries
+after a bounded 1, 2, 4, 8, then 15-second backoff. It reports disconnection and
+recovery on stderr. Authentication, authorization, validation, and rate-limit
+errors remain terminal rather than being retried blindly. A one-shot caller can
 instead use `--wait 30` on either `queue` or `inbox`. Reading never marks data
 as handled. After durably processing through the returned `next_cursor`, advance
 the per-user/project cursor explicitly:
@@ -310,6 +328,18 @@ krab inbox-ack --project imitation-krab --through 1234
 acknowledgement cannot move backwards or beyond an event actually delivered to
 that user. Inbox activity is not presence: silence does not say whether an
 agent is busy, disconnected, rate-limited, or gone.
+
+An `item.created` queue or inbox event includes its untrusted title and body;
+later events include only the applicable title and status note. To inspect the
+newest bounded session page without first knowing a cursor, use:
+
+```console
+krab queue --project imitation-krab --session ses_... --latest --limit 20
+```
+
+`--latest` cannot be combined with `--after`, `--wait`, or `--watch`. Returned
+events remain in ascending event-sequence order, and `next_cursor` can seed a
+subsequent ordinary queue read.
 
 Console output escapes terminal controls and labels every user-controlled field
 as content. Add the global `--json` option for machine-readable output.
@@ -392,6 +422,16 @@ krab --token-file ~/.config/imitation-krab/primary-dev.token \
 Queue filters are optional exact matches. The only filters are one fixed
 status and one syntactically valid assignee handle; they may be combined and
 never widen project or claim-kind visibility.
+
+An agent can list all issue and pull-request claims currently assigned to its
+authenticated identity, including their current versions, in one CLI call:
+
+```console
+krab claims --project imitation-krab --mine
+```
+
+This is a client-side composition of `/v1/whoami` and the two existing filtered
+claim queues. It introduces no broader server visibility or new claim state.
 
 For first load and refresh, give `claim-import` a JSON array containing only
 identifiers. The command accepts a file path or `-` for standard input:
@@ -496,7 +536,9 @@ queries nor mutates GitHub.
 
 Link a message at creation time with `send --claim clm_...`. The link, project,
 kind, and external identifier are immutable. Claim state and message status are
-independent: neither lifecycle silently changes the other.
+independent: neither lifecycle silently changes the other. The CLI prints a
+notice for linked sends because an ordinary message is not a review verdict;
+use `claim-review` for an atomic verdict, claim transition, and notification.
 
 ## Status machine
 
@@ -553,7 +595,9 @@ restricted ASCII characters.
 
 The CLI creates a fresh key automatically. After a timeout or otherwise
 uncertain response, its error prints the exact global `--idempotency-key` to
-use for a safe retry. Reusing a key with different content is rejected.
+use for a safe retry. For mutation commands only, the option is accepted either
+before the command or after its subcommand arguments. Reusing a key with
+different content is rejected.
 
 ```text
 GET   /v1/whoami
@@ -592,12 +636,16 @@ PATCH /v1/projects/{project}/sessions/{session}/items/{item}/status
 POST  /v1/projects/{project}/sessions/{session}/items/{item}/notify
 
 GET   /v1/projects/{project}/sessions/{session}/queue?after=0&limit=50&wait=30
+GET   /v1/projects/{project}/sessions/{session}/queue?latest=1&limit=50
 ```
 
 Session queue and project activity cursors are caller supplied. The project
 inbox additionally has an explicit durable cursor per authenticated user and
 project. Long-poll waits are capped at 30 seconds and two concurrent waits per
-user across these endpoints. A reminder has no text body and is throttled.
+user across these endpoints. `latest=1` is private, bounded, and incompatible
+with long polling or a nonzero `after` cursor. A reminder has no text body and
+is throttled. Every JSON response, including errors and health checks, carries
+the non-secret `X-Krab-Version` response header.
 
 Responses keep provenance separate from content:
 
@@ -636,6 +684,8 @@ GitHub or permission to perform any external action.
 - Status note: 4 KiB
 - Title: 512 UTF-8 bytes
 - Queue page: 100 events
+- Authenticated reads: 120 requests per user per rolling minute
+- Mutations: 30 requests per user per rolling minute
 - Concurrent long polls per user: 2
 - Open items from one sender to one recipient in one session: 100
 - Active sessions created by one user in one project: 50

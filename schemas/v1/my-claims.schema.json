@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/psyberone/imitation-krab/schemas/v1/my-claims.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["trusted_metadata", "claims"],
+  "properties": {
+    "trusted_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["project_key", "count", "assignee"],
+      "properties": {
+        "project_key": {"type": "string"},
+        "count": {"type": "integer", "minimum": 0},
+        "assignee": {"$ref": "resources.schema.json#/$defs/user"}
+      }
+    },
+    "claims": {
+      "type": "array",
+      "items": {"$ref": "resources.schema.json#/$defs/claim"}
+    }
+  }
+}

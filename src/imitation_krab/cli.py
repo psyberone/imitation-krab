@@ -5,10 +5,12 @@ import http.client
 import json
 import logging
 import os
+import re
 import sqlite3
 import stat
 import sys
 import tempfile
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -54,6 +56,14 @@ class ClientError(RuntimeError):
     pass
 
 
+class ServerUnavailable(ClientError):
+    pass
+
+
+SERVER_VERSION_RE = re.compile(r"\A[0-9A-Za-z][0-9A-Za-z.+-]{0,63}\Z")
+WATCH_RETRY_SECONDS = (1, 2, 4, 8, 15)
+
+
 class APIClient:
     def __init__(self, base_url: str, token: str, idempotency_key: str | None = None):
         parsed = urlsplit(base_url)
@@ -76,6 +86,8 @@ class APIClient:
         self.host = parsed.hostname
         self.token = token
         self.idempotency_key = idempotency_key
+        self.server_version: str | None = None
+        self._version_warning_emitted = False
 
     def request(
         self,
@@ -108,13 +120,14 @@ class APIClient:
             response = connection.getresponse()
             raw = response.read()
             status = response.status
+            self._observe_server_version(response.getheader("X-Krab-Version"))
         except (OSError, TimeoutError, http.client.HTTPException) as exc:
             retry = (
                 f"; mutation outcome may be unknown; retry with --idempotency-key {request_key}"
                 if request_key
                 else ""
             )
-            raise ClientError(f"server unavailable: {exc}{retry}") from None
+            raise ServerUnavailable(f"server unavailable: {exc}{retry}") from None
         finally:
             connection.close()
         if status >= 400:
@@ -144,6 +157,28 @@ class APIClient:
         if not isinstance(result, dict):
             raise ClientError("server returned an unexpected response")
         return result
+
+    def _observe_server_version(self, value: object) -> None:
+        if value is None:
+            if not self._version_warning_emitted:
+                self._version_warning_emitted = True
+                _safe_notice(
+                    "warning",
+                    "server did not report a Krab version; it may predate "
+                    "compatibility reporting",
+                )
+            return
+        if not isinstance(value, str) or not SERVER_VERSION_RE.fullmatch(value):
+            return
+        self.server_version = value
+        if value == __version__ or self._version_warning_emitted:
+            return
+        self._version_warning_emitted = True
+        _safe_notice(
+            "warning",
+            f"version mismatch: CLI {__version__} is talking to server {value}; "
+            "update both if a command is unavailable",
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -222,6 +257,12 @@ def build_parser() -> argparse.ArgumentParser:
         "prs", help="list the project's pull-request claim queue"
     )
     _add_claim_list_args(pull_requests)
+
+    claims = sub.add_parser(
+        "claims", help="list the authenticated user's issue and pull-request claims"
+    )
+    claims.add_argument("--project", required=True)
+    claims.add_argument("--mine", action="store_true", required=True)
 
     claim_add = sub.add_parser(
         "claim-add", help="register an issue or pull request as available work"
@@ -312,7 +353,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     queue = sub.add_parser("queue", help="read the authenticated user's private queue")
     _add_scope_args(queue)
-    queue.add_argument("--after", type=int, default=0)
+    queue_cursor = queue.add_mutually_exclusive_group()
+    queue_cursor.add_argument("--after", type=int)
+    queue_cursor.add_argument(
+        "--latest", action="store_true", help="read only the newest bounded page"
+    )
     queue.add_argument("--limit", type=int, default=50)
     queue_wait = queue.add_mutually_exclusive_group()
     queue_wait.add_argument("--watch", action="store_true")
@@ -352,6 +397,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_scope_args(notify)
     notify.add_argument("item")
+    for mutation_parser in (
+        claim_add,
+        claim_import,
+        claim,
+        claim_assign,
+        claim_release,
+        claim_status,
+        claim_review,
+        session_create,
+        session_close,
+        send,
+        inbox_ack,
+        status,
+        notify,
+    ):
+        _add_mutation_retry_arg(mutation_parser)
     return parser
 
 
@@ -369,6 +430,14 @@ def _add_claim_list_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--project", required=True)
     parser.add_argument("--status", choices=sorted(CLAIM_STATUS_ALIASES))
     parser.add_argument("--assignee")
+
+
+def _add_mutation_retry_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--idempotency-key",
+        default=argparse.SUPPRESS,
+        help="reuse this key when safely retrying this mutation",
+    )
 
 
 def _add_text_source(
@@ -453,6 +522,44 @@ def _run_client(args: argparse.Namespace, client: APIClient) -> int:
     if command == "projects":
         result = client.request("GET", "/v1/projects")
         _emit(args, result, kind="projects")
+    elif command == "claims":
+        identity_response = client.request("GET", "/v1/whoami")
+        try:
+            identity = identity_response["trusted_metadata"]
+            user_id = identity["user_id"]
+            handle = identity["handle"]
+        except (KeyError, TypeError) as exc:
+            raise ClientError("server returned an unexpected identity response") from exc
+        claims: list[dict[str, Any]] = []
+        project_key: str | None = None
+        for queue in ("issues", "pull-requests"):
+            response = client.request(
+                "GET",
+                f"/v1/projects/{_segment(args.project)}/{queue}",
+                query={"assignee": handle},
+            )
+            entries = response.get("claims")
+            metadata = response.get("trusted_metadata")
+            response_project = (
+                metadata.get("project_key") if isinstance(metadata, dict) else None
+            )
+            if not isinstance(entries, list) or not isinstance(response_project, str):
+                raise ClientError("server returned an unexpected claim-list response")
+            if project_key is not None and response_project != project_key:
+                raise ClientError("server returned inconsistent claim-list scopes")
+            project_key = response_project
+            claims.extend(entries)
+        if project_key is None:
+            raise ClientError("server returned an unexpected claim-list response")
+        result = {
+            "trusted_metadata": {
+                "project_key": project_key,
+                "count": len(claims),
+                "assignee": {"user_id": user_id, "handle": handle},
+            },
+            "claims": claims,
+        }
+        _emit(args, result, kind="claims")
     elif command in {"issues", "prs"}:
         queue = "issues" if command == "issues" else "pull-requests"
         query = {}
@@ -583,17 +690,35 @@ def _run_client(args: argparse.Namespace, client: APIClient) -> int:
             payload=send_payload,
         )
         _emit(args, result, kind="item")
+        if args.claim is not None:
+            _safe_notice(
+                "notice",
+                "send --claim linked the message, but claim state was not changed; "
+                "use claim-review for a review verdict",
+            )
     elif command == "queue":
-        cursor = args.after
-        while True:
+        if args.latest:
+            if args.watch or args.wait:
+                raise ClientError("--latest cannot be combined with --watch or --wait")
             result = client.request(
                 "GET",
                 _scope_path(args) + "/queue",
-                query={
-                    "after": cursor,
-                    "limit": args.limit,
-                    "wait": 30 if args.watch else args.wait,
-                },
+                query={"latest": 1, "limit": args.limit},
+            )
+            _emit(args, result, kind="queue")
+            return 0
+        cursor = args.after if args.after is not None else 0
+        while True:
+            path = _scope_path(args) + "/queue"
+            query = {
+                "after": cursor,
+                "limit": args.limit,
+                "wait": 30 if args.watch else args.wait,
+            }
+            result = (
+                _watch_request(client, path, query)
+                if args.watch
+                else client.request("GET", path, query=query)
             )
             _emit(args, result, kind="queue")
             cursor = result["trusted_metadata"]["next_cursor"]
@@ -611,10 +736,11 @@ def _run_client(args: argparse.Namespace, client: APIClient) -> int:
                 query["unread"] = 1
             else:
                 query["after"] = cursor if cursor is not None else 0
-            result = client.request(
-                "GET",
-                f"/v1/projects/{_segment(args.project)}/inbox",
-                query=query,
+            path = f"/v1/projects/{_segment(args.project)}/inbox"
+            result = (
+                _watch_request(client, path, query)
+                if args.watch
+                else client.request("GET", path, query=query)
             )
             _emit(args, result, kind="queue")
             cursor = result["trusted_metadata"]["next_cursor"]
@@ -657,6 +783,27 @@ def _run_client(args: argparse.Namespace, client: APIClient) -> int:
     else:
         raise ValueError("unknown command")
     return 0
+
+
+def _watch_request(
+    client: APIClient, path: str, query: dict[str, Any]
+) -> dict[str, Any]:
+    failures = 0
+    while True:
+        try:
+            result = client.request("GET", path, query=query)
+        except ServerUnavailable as exc:
+            delay = WATCH_RETRY_SECONDS[min(failures, len(WATCH_RETRY_SECONDS) - 1)]
+            failures += 1
+            _safe_notice(
+                "warning",
+                f"watch disconnected; retrying in {delay}s: {exc}",
+            )
+            time.sleep(delay)
+            continue
+        if failures:
+            _safe_notice("notice", "watch resumed")
+        return result
 
 
 def _scope_path(args: argparse.Namespace) -> str:
@@ -994,6 +1141,12 @@ def _print_untrusted(value: str, flags: list[str], *, field: str) -> None:
 
 def _safe_error(message: str) -> None:
     print("error:", file=sys.stderr)
+    for line in terminal_lines(message):
+        print(line, file=sys.stderr)
+
+
+def _safe_notice(label: str, message: str) -> None:
+    print(f"{label}:", file=sys.stderr)
     for line in terminal_lines(message):
         print(line, file=sys.stderr)
 

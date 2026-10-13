@@ -1344,6 +1344,57 @@ class ServiceTests(ServiceFixture):
             self.service.get_queue(self.mallory, "project-one", self.session_id)
         self.assertEqual(caught.exception.status, 404)
 
+    def test_private_queue_latest_returns_the_bounded_tail_in_sequence_order(self) -> None:
+        created = [
+            self.create_item(key=f"latest-item-{number:04d}").payload
+            for number in range(1, 4)
+        ]
+        sequences = [item["trusted_metadata"]["event_seq"] for item in created]
+
+        latest = self.service.get_queue(
+            self.bob,
+            "project-one",
+            self.session_id,
+            limit=2,
+            latest=True,
+        )
+        self.assertEqual(
+            [event["trusted_metadata"]["event_seq"] for event in latest["events"]],
+            sequences[-2:],
+        )
+        self.assertTrue(latest["trusted_metadata"]["latest"])
+        self.assertEqual(latest["trusted_metadata"]["next_cursor"], sequences[-1])
+
+        self.assertEqual(
+            self.service.get_queue(
+                self.alice,
+                "project-one",
+                self.session_id,
+                limit=2,
+                latest=True,
+            )["events"],
+            [],
+        )
+
+        ordinary = self.service.get_queue(
+            self.bob, "project-one", self.session_id, after=0, limit=1
+        )
+        self.assertNotIn("latest", ordinary["trusted_metadata"])
+        self.assertEqual(
+            ordinary["events"][0]["trusted_metadata"]["event_seq"], sequences[0]
+        )
+
+        for kwargs in (
+            {"latest": "yes"},
+            {"latest": True, "after": 1},
+            {"latest": True, "wait": 1},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ServiceError) as caught:
+                self.service.get_queue(
+                    self.bob, "project-one", self.session_id, **kwargs
+                )
+            self.assertEqual(caught.exception.code, "invalid_latest")
+
     def test_idempotent_create_and_conflicting_reuse(self) -> None:
         first = self.create_item(key="same-request-0001")
         second = self.create_item(key="same-request-0001")

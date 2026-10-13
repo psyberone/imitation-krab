@@ -11,11 +11,13 @@ from contextlib import redirect_stderr, redirect_stdout
 from io import BytesIO, StringIO
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
+from imitation_krab import __version__
 from imitation_krab.cli import (
     APIClient,
     ClientError,
+    ServerUnavailable,
     _emit,
     _read_claim_manifest,
     _read_token,
@@ -115,6 +117,9 @@ def item_payload() -> dict:
 
 
 class CLIBehaviorTests(unittest.TestCase):
+    def test_release_version_is_0_6_1(self) -> None:
+        self.assertEqual(__version__, "0.6.1")
+
     def test_api_client_serializes_requests_and_rejects_bad_responses(self) -> None:
         client = APIClient(
             "http://localhost:9876", TOKEN, idempotency_key="stable-key"
@@ -170,6 +175,41 @@ class CLIBehaviorTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ClientError, "invalid port"):
             APIClient("http://localhost:not-a-port", TOKEN)
+
+    def test_api_client_reports_server_version_skew_once_without_polluting_stdout(self) -> None:
+        client = APIClient("http://localhost:9876", TOKEN)
+        error = StringIO()
+        with (
+            patch("imitation_krab.cli.http.client.HTTPConnection") as connection,
+            redirect_stderr(error),
+        ):
+            response = connection.return_value.getresponse.return_value
+            response.status = 200
+            response.read.return_value = b'{"accepted":true}'
+            response.getheader.return_value = "0.5.0"
+            self.assertEqual(client.request("GET", "/v1/projects"), {"accepted": True})
+            self.assertEqual(client.request("GET", "/v1/projects"), {"accepted": True})
+
+        warning = error.getvalue()
+        self.assertIn(f"CLI {__version__}", warning)
+        self.assertIn("server 0.5.0", warning)
+        self.assertEqual(warning.count("version mismatch"), 1)
+        self.assertEqual(client.server_version, "0.5.0")
+
+        legacy = APIClient("http://localhost:9876", TOKEN)
+        legacy_error = StringIO()
+        with (
+            patch("imitation_krab.cli.http.client.HTTPConnection") as connection,
+            redirect_stderr(legacy_error),
+        ):
+            response = connection.return_value.getresponse.return_value
+            response.status = 200
+            response.read.return_value = b'{"accepted":true}'
+            response.getheader.return_value = None
+            legacy.request("GET", "/v1/projects")
+            legacy.request("GET", "/v1/projects")
+        self.assertIn("did not report a Krab version", legacy_error.getvalue())
+        self.assertEqual(legacy_error.getvalue().count("did not report"), 1)
 
     def test_every_client_command_maps_to_an_exact_request(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -411,6 +451,23 @@ class CLIBehaviorTests(unittest.TestCase):
                 ),
                 (
                     [
+                        "queue",
+                        "--project",
+                        project,
+                        "--session",
+                        SESSION_ID,
+                        "--latest",
+                        "--limit",
+                        "8",
+                    ],
+                    (
+                        "GET",
+                        base + "/queue",
+                        {"query": {"latest": 1, "limit": 8}},
+                    ),
+                ),
+                (
+                    [
                         "inbox",
                         "--project",
                         project,
@@ -487,9 +544,16 @@ class CLIBehaviorTests(unittest.TestCase):
 
             for argv, expected in cases:
                 with self.subTest(command=argv[0]):
+                    if expected[0] in {"POST", "PATCH"}:
+                        retry_args = parse_args(
+                            [*argv, "--idempotency-key", "after-command-retry"]
+                        )
+                        self.assertEqual(
+                            retry_args.idempotency_key, "after-command-retry"
+                        )
                     client = RecordingClient()
                     output = StringIO()
-                    with redirect_stdout(output):
+                    with redirect_stdout(output), redirect_stderr(StringIO()):
                         result = _run_client(parse_args(argv), client)  # type: ignore[arg-type]
                     self.assertEqual(result, 0)
                     self.assertEqual(client.calls, [expected])
@@ -497,6 +561,165 @@ class CLIBehaviorTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "unknown command"):
             _run_client(SimpleNamespace(command="unknown"), RecordingClient())  # type: ignore[arg-type]
+
+    def test_claims_mine_combines_only_the_authenticated_users_claims(self) -> None:
+        issue = claim_payload()
+        pull_request = json.loads(json.dumps(issue))
+        pull_request["trusted_metadata"].update(
+            {"claim_id": "clm_" + "f" * 32, "kind": "pull_request"}
+        )
+        client = Mock()
+        client.request.side_effect = [
+            {
+                "trusted_metadata": {
+                    "user_id": "usr_" + "a" * 32,
+                    "handle": "alice",
+                    "token_version": 1,
+                }
+            },
+            {
+                "trusted_metadata": {"project_key": "project-one"},
+                "claims": [issue],
+            },
+            {
+                "trusted_metadata": {"project_key": "project-one"},
+                "claims": [pull_request],
+            },
+        ]
+        output = StringIO()
+        with redirect_stdout(output):
+            result = _run_client(
+                parse_args(["claims", "--mine", "--project", "project-one"]),
+                client,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            client.request.call_args_list,
+            [
+                call("GET", "/v1/whoami"),
+                call(
+                    "GET",
+                    "/v1/projects/project-one/issues",
+                    query={"assignee": "alice"},
+                ),
+                call(
+                    "GET",
+                    "/v1/projects/project-one/pull-requests",
+                    query={"assignee": "alice"},
+                ),
+            ],
+        )
+        rendered = json.loads(output.getvalue())
+        self.assertEqual(rendered["trusted_metadata"]["count"], 2)
+        self.assertEqual(rendered["trusted_metadata"]["assignee"]["handle"], "alice")
+        self.assertEqual(
+            [claim["trusted_metadata"]["kind"] for claim in rendered["claims"]],
+            ["issue", "pull_request"],
+        )
+
+        client.reset_mock()
+        client.request.side_effect = [
+            {
+                "trusted_metadata": {
+                    "user_id": "usr_" + "a" * 32,
+                    "handle": "alice",
+                    "token_version": 1,
+                }
+            },
+            {"trusted_metadata": {"project_key": "project-one"}, "claims": []},
+            {"trusted_metadata": {"project_key": "project-two"}, "claims": []},
+        ]
+        with self.assertRaisesRegex(ClientError, "inconsistent claim-list scopes"):
+            _run_client(
+                parse_args(["claims", "--mine", "--project", "project-one"]),
+                client,
+            )
+
+    def test_watch_reconnects_after_transport_failure_and_keeps_its_cursor(self) -> None:
+        client = Mock()
+        client.request.side_effect = [
+            ServerUnavailable("server unavailable: connection refused"),
+            {"trusted_metadata": {"next_cursor": 9}, "events": []},
+            KeyboardInterrupt(),
+        ]
+        output = StringIO()
+        error = StringIO()
+        args = parse_args(
+            [
+                "queue",
+                "--project",
+                "project-one",
+                "--session",
+                SESSION_ID,
+                "--after",
+                "7",
+                "--watch",
+            ]
+        )
+        with (
+            patch("imitation_krab.cli.time.sleep") as sleep,
+            redirect_stdout(output),
+            redirect_stderr(error),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            _run_client(args, client)
+
+        self.assertEqual(sleep.call_args_list, [call(1)])
+        queries = [entry.kwargs["query"] for entry in client.request.call_args_list]
+        self.assertEqual([query["after"] for query in queries], [7, 7, 9])
+        self.assertIn("watch disconnected", error.getvalue())
+        self.assertIn("watch resumed", error.getvalue())
+
+        client.reset_mock()
+        client.request.side_effect = ClientError("unauthorized")
+        with (
+            patch("imitation_krab.cli.time.sleep") as sleep,
+            self.assertRaisesRegex(ClientError, "unauthorized"),
+        ):
+            _run_client(args, client)
+        sleep.assert_not_called()
+
+        latest_watch = parse_args(
+            [
+                "queue",
+                "--project",
+                "project-one",
+                "--session",
+                SESSION_ID,
+                "--latest",
+                "--watch",
+            ]
+        )
+        with self.assertRaisesRegex(ClientError, "latest.*watch"):
+            _run_client(latest_watch, RecordingClient())
+
+    def test_linked_send_warns_that_claim_state_does_not_change(self) -> None:
+        client = RecordingClient(result=item_payload())
+        error = StringIO()
+        with redirect_stdout(StringIO()), redirect_stderr(error):
+            _run_client(
+                parse_args(
+                    [
+                        "send",
+                        "--project",
+                        "project-one",
+                        "--session",
+                        SESSION_ID,
+                        "--to",
+                        "bob",
+                        "--title",
+                        "Review",
+                        "--body",
+                        "Please review",
+                        "--claim",
+                        CLAIM_ID,
+                    ]
+                ),
+                client,
+            )
+        self.assertIn("claim state was not changed", error.getvalue())
+        self.assertIn("claim-review", error.getvalue())
 
     def test_claim_import_dry_run_and_manifest_validation(self) -> None:
         client = RecordingClient(

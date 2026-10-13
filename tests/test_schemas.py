@@ -32,6 +32,7 @@ class SchemaFileTests(unittest.TestCase):
             "error.schema.json",
             "inbox-ack.schema.json",
             "item.schema.json",
+            "my-claims.schema.json",
             "project-list.schema.json",
             "queue.schema.json",
             "resources.schema.json",
@@ -153,6 +154,20 @@ class ResponseSchemaTests(unittest.TestCase):
             "claim-list.schema.json",
             self.service.list_work_claims(self.bob, "project-one", "issue"),
         )
+        self.validate(
+            "my-claims.schema.json",
+            {
+                "trusted_metadata": {
+                    "project_key": "project-one",
+                    "count": 0,
+                    "assignee": {
+                        "user_id": self.bob["id"],
+                        "handle": self.bob["handle"],
+                    },
+                },
+                "claims": [],
+            },
+        )
 
         item = self.service.create_item(
             self.alice,
@@ -176,6 +191,12 @@ class ResponseSchemaTests(unittest.TestCase):
         self.validate(
             "queue.schema.json",
             self.service.get_queue(self.bob, "project-one", session_id),
+        )
+        self.validate(
+            "queue.schema.json",
+            self.service.get_queue(
+                self.bob, "project-one", session_id, latest=True
+            ),
         )
         self.validate(
             "queue.schema.json",

@@ -1676,9 +1676,12 @@ class Service:
         after: int = 0,
         limit: int = 50,
         wait: int = 0,
+        latest: bool = False,
     ) -> dict[str, Any]:
         project_key = self._valid_project_key(project_key)
         session_id = self._valid_object_id(session_id, "ses")
+        if not isinstance(latest, bool):
+            raise ServiceError(400, "invalid_latest", "latest must be a boolean")
         if isinstance(after, bool) or not isinstance(after, int) or after < 0:
             raise ServiceError(
                 400, "invalid_cursor", "after must be a non-negative integer"
@@ -1701,6 +1704,12 @@ class Service:
                 "invalid_wait",
                 f"wait must be between 0 and {MAX_LONG_POLL_SECONDS}",
             )
+        if latest and (after != 0 or wait != 0):
+            raise ServiceError(
+                400,
+                "invalid_latest",
+                "latest cannot be combined with a non-zero after or wait",
+            )
 
         deadline = time.monotonic() + wait
         while True:
@@ -1708,8 +1717,7 @@ class Service:
             try:
                 project = self._project_membership(conn, actor["id"], project_key)
                 self._session_membership(conn, actor["id"], project["id"], session_id)
-                rows = conn.execute(
-                    """
+                query = """
                     SELECT
                         e.*, i.title, i.body, i.status AS current_status, i.version,
                         i.work_claim_id,
@@ -1726,12 +1734,19 @@ class Service:
                     JOIN users actor ON actor.id = e.actor_id
                     LEFT JOIN work_claims wc ON wc.id = i.work_claim_id
                     WHERE d.user_id = ? AND e.project_id = ? AND e.session_id = ?
-                      AND e.seq > ?
-                    ORDER BY e.seq
-                    LIMIT ?
-                    """,
-                    (actor["id"], project["id"], session_id, after, limit),
-                ).fetchall()
+                """
+                parameters: tuple[Any, ...] = (
+                    (actor["id"], project["id"], session_id, limit)
+                    if latest
+                    else (actor["id"], project["id"], session_id, after, limit)
+                )
+                if latest:
+                    query += " ORDER BY e.seq DESC LIMIT ?"
+                else:
+                    query += " AND e.seq > ? ORDER BY e.seq ASC LIMIT ?"
+                rows = conn.execute(query, parameters).fetchall()
+                if latest:
+                    rows.reverse()
             finally:
                 conn.close()
             if rows or time.monotonic() >= deadline:
@@ -1739,13 +1754,16 @@ class Service:
             time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
 
         events = [self._serialize_queue_event(row, project_key) for row in rows]
+        metadata = {
+            "project_key": project_key,
+            "session_id": session_id,
+            "after": after,
+            "next_cursor": rows[-1]["seq"] if rows else after,
+        }
+        if latest:
+            metadata["latest"] = True
         return {
-            "trusted_metadata": {
-                "project_key": project_key,
-                "session_id": session_id,
-                "after": after,
-                "next_cursor": rows[-1]["seq"] if rows else after,
-            },
+            "trusted_metadata": metadata,
             "events": events,
         }
 

@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from . import __version__
 from .config import (
     CONTAINER_HOST,
     DEFAULT_HOST,
@@ -440,10 +441,11 @@ class KrabRequestHandler(BaseHTTPRequestHandler):
             and path[3] == "sessions"
             and path[5] == "queue"
         ):
-            self._require_query(query, {"after", "limit", "wait"})
+            self._require_query(query, {"after", "limit", "wait", "latest"})
             after = self._query_int(query, "after", 0)
             limit = self._query_int(query, "limit", 50)
             wait = self._query_int(query, "wait", 0)
+            latest = self._query_bool(query, "latest", False)
             acquired = False
             if wait:
                 acquired = self.server.long_polls.acquire(
@@ -457,7 +459,13 @@ class KrabRequestHandler(BaseHTTPRequestHandler):
                     )
             try:
                 return 200, self.server.service.get_queue(
-                    actor, path[2], path[4], after=after, limit=limit, wait=wait
+                    actor,
+                    path[2],
+                    path[4],
+                    after=after,
+                    limit=limit,
+                    wait=wait,
+                    latest=latest,
                 )
             finally:
                 if acquired:
@@ -799,6 +807,7 @@ class KrabRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Krab-Version", __version__)
         if request_id:
             self.send_header("X-Request-ID", request_id)
         if status == 401:

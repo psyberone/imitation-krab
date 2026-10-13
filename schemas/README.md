@@ -14,6 +14,7 @@ routing, versions, timestamps, and sequence numbers are under
 | Single-claim mutations | `v1/claim.schema.json` |
 | `claim-import` | `v1/claim-import.schema.json` |
 | `issues` / `prs` | `v1/claim-list.schema.json` |
+| `claims --mine` | `v1/my-claims.schema.json` |
 | `claim-show` | `v1/claim-detail.schema.json` |
 | `send` / `show` / item status | `v1/item.schema.json` |
 | `queue` / `inbox` | `v1/queue.schema.json` |

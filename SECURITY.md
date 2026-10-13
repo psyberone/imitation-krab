@@ -51,6 +51,9 @@ the raw bearer token in model context.
     produced by an allowlist serializer that selects event metadata and the
     immutable title, but never selects bodies, notes, verdict prose, history,
     transcripts, or content risk flags.
+17. A newest-page queue read uses the same authenticated delivery and session
+    scope as an ordinary queue read. It changes ordering and pagination only;
+    it never broadens content visibility or advances acknowledgement state.
 
 ## Trust boundaries
 
@@ -127,6 +130,7 @@ content.
 | Malicious external identifier | Restricted ASCII and length, opaque-reference semantics, no URL parsing/fetching, and no external action |
 | Retry duplication or replay confusion | Required idempotency keys bound to actor, operation, and request hash |
 | Cross-session inbox disclosure | Project membership plus authenticated-user delivery rows and session-membership joins; no project-wide broadcast rows |
+| Newest-page queue disclosure | Identical delivery/session authorization and event serializer as forward queue reads; fixed page cap; no long-poll combination |
 | Project activity overexposure | Active project-membership check, explicit SQL column selection, dedicated allowlist serializer, title-only untrusted text, no delivery body/note/history/risk fields |
 | Lost or forged read position | Explicit per-user/project monotonic acknowledgement bounded by the highest event delivered to that same user |
 | Queue flooding | Request throttles, per-user long-poll concurrency, participant/session/event limits, message-size limits, per-route open-item cap, and database-size cap |
@@ -216,6 +220,12 @@ checks limit other users' data, not that user's own blast radius.
 - Project inbox delivery and acknowledgement are not presence. The service has
   no heartbeat and cannot distinguish a working, disconnected, paused,
   rate-limited, or dead agent.
+- CLI watch recovery retries transport failures only. Its cursor survives a
+  daemon restart while the client process remains alive; restarting the client
+  still requires a supplied cursor or the durable project-inbox acknowledgement.
+  It is not a runtime wake-up bridge.
+- `queue --latest` is a bounded historical view, not an unread marker. It does
+  not acknowledge, close, or otherwise mutate the returned items.
 - Project members can see the title and routing metadata of every work-item
   event in their project, including sessions they do not participate in. Keep
   private prose and secrets out of titles; use bodies and notes for content that
