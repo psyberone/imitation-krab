@@ -10,36 +10,6 @@ OBJECT_ID_RE = re.compile(r"^(?:usr|ses|itm|clm)_[0-9a-f]{32}$")
 IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 EXTERNAL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/#-]{0,255}$")
 
-_SEMANTIC_FLAGS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    (
-        "instruction_override",
-        re.compile(
-            r"\b(?:ignore|disregard|override|forget)\b.{0,48}\b"
-            r"(?:instruction|instructions|rules|prompt|policy|policies)\b",
-            re.IGNORECASE | re.DOTALL,
-        ),
-    ),
-    (
-        "credential_request",
-        re.compile(
-            r"\b(?:reveal|show|print|send|upload|exfiltrate|return)\b.{0,48}\b"
-            r"(?:token|credential|credentials|secret|password|api[- ]?key)\b",
-            re.IGNORECASE | re.DOTALL,
-        ),
-    ),
-    (
-        "role_delimiter",
-        re.compile(
-            r"(?:<\|\s*(?:system|developer|assistant|user)\s*\|>|"
-            r"\[(?:system|developer|assistant)\]|"
-            r"\b(?:system|developer)\s+(?:message|prompt)\s*:)",
-            re.IGNORECASE,
-        ),
-    ),
-    ("external_url", re.compile(r"\bhttps?://", re.IGNORECASE)),
-)
-
-
 class ValidationError(ValueError):
     """Input failed deterministic validation."""
 
@@ -126,8 +96,10 @@ def sanitize_text(
                 f"U+{codepoint:04X}"
             )
 
-    flags = tuple(name for name, pattern in _SEMANTIC_FLAGS if pattern.search(value))
-    return SanitizedText(value, flags)
+    # Validation is deliberately mechanical. Authenticated participants must be
+    # able to discuss prompts, credentials, URLs, and tool names without the
+    # mailbox assigning semantic meaning to their prose.
+    return SanitizedText(value, ())
 
 
 def merge_risk_flags(*groups: tuple[str, ...]) -> tuple[str, ...]:

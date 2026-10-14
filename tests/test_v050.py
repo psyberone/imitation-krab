@@ -119,7 +119,8 @@ class V050ServiceTests(unittest.TestCase):
             notification["trusted_metadata"]["work_claim"]["claim_id"], claim_id
         )
         self.assertIn("review round 1", notification["untrusted_text"]["title"])
-        self.assertIn("instruction_override", notification["content_risk_flags"])
+        self.assertEqual(notification["content_risk_flags"], [])
+        self.assertEqual(notification["untrusted_text"]["body"], payload["body"])
 
         inbox = self.service.get_project_inbox(self.bob, "project-one")
         self.assertEqual(len(inbox["events"]), 1)

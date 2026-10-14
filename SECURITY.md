@@ -84,9 +84,11 @@ accepted as a user login credential by an external orchestrator.
 ### Untrusted content
 
 Project and session labels, titles, bodies, notes, and result summaries remain
-untrusted even when an authenticated user supplied them. API responses place
-them under `untrusted_text`; consumers must not merge them into a system or
-developer instruction channel.
+user-controlled even when an authenticated participant supplied them. API
+responses place them under `untrusted_text` to distinguish provenance from
+server-attested control data. The label does not mean hostile or prohibited:
+agents can use this text as ordinary peer communication, while Krab does not
+turn the prose itself into permissions or server-side actions.
 
 A work-item title is visible to all active members of its project. Bodies,
 notes, verdict prose, and history remain visible only through existing
@@ -137,7 +139,7 @@ content.
 | Terminal/log injection | Dangerous controls rejected on ingress; console escapes again on output; structured logs omit bodies |
 | JSON ambiguity | Strict UTF-8, body cap, duplicate-key rejection, finite JSON numbers, unknown-field rejection |
 | Unicode identity spoofing | Handles, project keys, IDs, statuses, and idempotency keys use restricted ASCII |
-| Prompt injection | Explicit untrusted-content envelope, risk flags, no automatic execution, and authority determined only by structured policy |
+| Message text mistaken for control data | Explicit user-content envelope, no automatic execution, and authority determined only by authenticated identity and structured policy |
 | Direct-message abuse | No general message endpoint; text exists only on immutable work items and status events; reminders are bodyless |
 
 ## Content validation
@@ -155,10 +157,13 @@ The console renderer independently converts any unexpected control or format
 character to visible `\\uXXXX` notation. Output encoding is a separate boundary
 even though ingress validation should already have rejected those characters.
 
-Deterministic patterns add advisory flags for instruction overrides, role
-delimiters, credential requests, and external URLs. These flags deliberately do
-not rewrite content or grant/deny authority. Semantic filters are bypassable and
-can also flag legitimate security discussions.
+Text validation is deliberately mechanical. The server does not classify,
+rewrite, or flag prose based on instruction-like language, credential
+discussions, role delimiters, URLs, or command names. The v1
+`content_risk_flags` field is retained for wire compatibility and remains empty
+in current responses. Older stored rows may still carry flags produced by a
+previous release, but current serializers and the CLI do not surface or
+interpret them.
 
 ## Credential handling
 
@@ -204,7 +209,9 @@ checks limit other users' data, not that user's own blast radius.
 ## Known limits
 
 - There is no TLS or remote mode. Do not place a reverse proxy in front of v0.
-- Prompt-injection risk flags are telemetry, not prevention.
+- Krab does not perform semantic content screening. Authenticated participants
+  can send security discussions, URLs, prompts, and command names unchanged;
+  recipients apply any workflow-specific policy outside the mailbox.
 - A fully compromised daemon account or host can alter state and credentials.
 - A compromised authenticated agent can perform every operation granted to its
   identity until the token is revoked.
@@ -248,8 +255,8 @@ checks limit other users' data, not that user's own blast radius.
 
 Security-relevant changes should preserve tests for authentication isolation,
 scope isolation, fixed status transitions, optimistic concurrency,
-idempotency, strict JSON parsing, hostile Unicode/control characters, prompt
-risk tagging, immutable content and work links, queue privacy, atomic claim
-ownership, coordinator/admin creation and assignment boundaries, additive
+idempotency, strict JSON parsing, terminal-active Unicode/control characters,
+unchanged prose delivery, immutable content and work links, queue privacy,
+atomic claim ownership, coordinator/admin creation and assignment boundaries, additive
 import behavior, independent review and self-approval denial, exact scoped
 claim filters, release boundaries, and reminder throttling.

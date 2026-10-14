@@ -2379,11 +2379,9 @@ class Service:
                     "idempotency_conflict",
                     "idempotency key was used for another request",
                 )
-            return MutationResult(
-                existing["status_code"],
-                json.loads(existing["response_json"]),
-                replayed=True,
-            )
+            response = json.loads(existing["response_json"])
+            self._clear_legacy_content_flags(response)
+            return MutationResult(existing["status_code"], response, replayed=True)
         status_code, response = mutate()
         response_json = json.dumps(
             response, ensure_ascii=False, separators=(",", ":"), sort_keys=True
@@ -2405,6 +2403,17 @@ class Service:
             ),
         )
         return MutationResult(status_code, response)
+
+    @staticmethod
+    def _clear_legacy_content_flags(value: Any) -> None:
+        if isinstance(value, dict):
+            if "content_risk_flags" in value:
+                value["content_risk_flags"] = []
+            for child in value.values():
+                Service._clear_legacy_content_flags(child)
+        elif isinstance(value, list):
+            for child in value:
+                Service._clear_legacy_content_flags(child)
 
     @staticmethod
     def _serialize_work_claim(row: sqlite3.Row, project_key: str) -> dict[str, Any]:
@@ -2465,7 +2474,7 @@ class Service:
                 "updated_at": row["updated_at"],
             },
             "untrusted_text": {"title": row["title"], "body": row["body"]},
-            "content_risk_flags": json.loads(row["risk_flags"]),
+            "content_risk_flags": [],
         }
 
     @staticmethod
@@ -2480,7 +2489,7 @@ class Service:
                 "created_at": row["created_at"],
             },
             "untrusted_text": {"note": row["note"]},
-            "content_risk_flags": json.loads(row["risk_flags"]),
+            "content_risk_flags": [],
         }
 
     @staticmethod
@@ -2514,7 +2523,7 @@ class Service:
                 "created_at": row["created_at"],
             },
             "untrusted_text": text,
-            "content_risk_flags": json.loads(row["risk_flags"]),
+            "content_risk_flags": [],
         }
 
     @staticmethod

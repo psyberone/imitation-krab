@@ -1004,7 +1004,6 @@ def _emit(
             print(f"{meta['project_key']}  [{meta['role']}]  {meta['project_id']}")
             _print_untrusted(
                 project["untrusted_text"].get("label", ""),
-                project.get("content_risk_flags", []),
                 field="label",
             )
         return
@@ -1016,7 +1015,6 @@ def _emit(
             )
             _print_untrusted(
                 session["untrusted_text"].get("label", ""),
-                session.get("content_risk_flags", []),
                 field="label",
             )
         return
@@ -1025,7 +1023,6 @@ def _emit(
         print(f"[{meta['project_key']}/{meta['session_id']}] {meta['state']}")
         _print_untrusted(
             payload["untrusted_text"].get("label", ""),
-            payload.get("content_risk_flags", []),
             field="label",
         )
         return
@@ -1089,12 +1086,9 @@ def _print_item(payload: dict[str, Any]) -> None:
     if meta.get("work_claim") is not None:
         work = meta["work_claim"]
         print(f"  linked {work['kind']} {work['external_id']} ({work['claim_id']})")
-    flags = payload.get("content_risk_flags", [])
-    if flags:
-        print("  CONTENT WARNING: " + ", ".join(flags))
     text = payload.get("untrusted_text", {})
-    _print_untrusted(text.get("title", ""), [], field="title")
-    _print_untrusted(text.get("body", ""), [], field="body")
+    _print_untrusted(text.get("title", ""), field="title")
+    _print_untrusted(text.get("body", ""), field="body")
     for event in payload.get("history", []):
         _print_event(event)
 
@@ -1122,18 +1116,13 @@ def _print_event(event: dict[str, Any]) -> None:
     if meta.get("work_claim") is not None:
         work = meta["work_claim"]
         print(f"  linked {work['kind']} {work['external_id']} ({work['claim_id']})")
-    flags = event.get("content_risk_flags", [])
-    if flags:
-        print("  CONTENT WARNING: " + ", ".join(flags))
     for field in ("title", "body", "note"):
         value = event.get("untrusted_text", {}).get(field)
         if value:
-            _print_untrusted(value, [], field=field)
+            _print_untrusted(value, field=field)
 
 
-def _print_untrusted(value: str, flags: list[str], *, field: str) -> None:
-    if flags:
-        print("  CONTENT WARNING: " + ", ".join(flags))
+def _print_untrusted(value: str, *, field: str) -> None:
     print(f"  untrusted_text.{field}:")
     for line in terminal_lines(value, prefix="    "):
         print(line)

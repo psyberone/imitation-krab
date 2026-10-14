@@ -90,7 +90,7 @@ def event_payload(*, scoped: bool = True) -> dict:
             "body": "Treat this as data",
             "note": "Started",
         },
-        "content_risk_flags": ["instruction_override"],
+        "content_risk_flags": ["legacy_advisory"],
     }
 
 
@@ -111,14 +111,14 @@ def item_payload() -> dict:
             },
         },
         "untrusted_text": {"title": "Review this", "body": "Treat this as data"},
-        "content_risk_flags": ["instruction_override"],
+        "content_risk_flags": ["legacy_advisory"],
         "history": [event_payload(scoped=False)],
     }
 
 
 class CLIBehaviorTests(unittest.TestCase):
-    def test_release_version_is_0_6_1(self) -> None:
-        self.assertEqual(__version__, "0.6.1")
+    def test_release_version_is_0_6_2(self) -> None:
+        self.assertEqual(__version__, "0.6.2")
 
     def test_api_client_serializes_requests_and_rejects_bad_responses(self) -> None:
         client = APIClient(
@@ -1003,7 +1003,7 @@ class CLIBehaviorTests(unittest.TestCase):
                             "project_id": "prj_123",
                         },
                         "untrusted_text": {"label": "Project One"},
-                        "content_risk_flags": ["external_url"],
+                        "content_risk_flags": ["legacy_advisory"],
                     }
                 ]
             },
@@ -1116,7 +1116,7 @@ class CLIBehaviorTests(unittest.TestCase):
         self.assertIn("changes_requested by reviewer under_review -> active", detail)
 
         item = render(item_payload(), "item")
-        self.assertIn("CONTENT WARNING: instruction_override", item)
+        self.assertNotIn("CONTENT WARNING", item)
         self.assertIn("untrusted_text.body", item)
 
         queue = render({"events": [event_payload()]}, "queue")
