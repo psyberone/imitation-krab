@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import uuid
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode, urlsplit
@@ -490,11 +491,23 @@ def main(argv: list[str] | None = None) -> int:
 def _run_admin(args: argparse.Namespace, database: Database) -> int:
     command = args.admin_command
     if command == "user-create":
-        user, token = database.create_user(args.handle)
-        _emit_token_result(args, user, token, args.write_token, replace=False)
+        delivery = None
+        if args.write_token is not None:
+            delivery = lambda token: _write_token(
+                args.write_token, token, replace=False
+            )
+        user, token = database.create_user(args.handle, token_delivery=delivery)
+        _emit_token_result(args, user, token, args.write_token)
     elif command == "user-rotate":
-        user, token = database.rotate_user_token(args.handle)
-        _emit_token_result(args, user, token, args.write_token, replace=True)
+        delivery = None
+        if args.write_token is not None:
+            delivery = lambda token: _write_token(
+                args.write_token, token, replace=True
+            )
+        user, token = database.rotate_user_token(
+            args.handle, token_delivery=delivery
+        )
+        _emit_token_result(args, user, token, args.write_token)
     elif command == "user-disable":
         _emit(args, database.disable_user(args.handle))
     elif command == "user-list":
@@ -927,7 +940,12 @@ def _write_token(path: Path, token: str, *, replace: bool) -> None:
         try:
             os.write(fd, token.encode("ascii") + b"\n")
             os.fsync(fd)
-        finally:
+        except Exception:
+            os.close(fd)
+            with suppress(FileNotFoundError):
+                path.unlink()
+            raise
+        else:
             os.close(fd)
         os.chmod(path, 0o600)
         return
@@ -973,11 +991,8 @@ def _emit_token_result(
     user: dict[str, Any],
     token: str,
     token_path: Path | None,
-    *,
-    replace: bool,
 ) -> None:
     if token_path:
-        _write_token(token_path, token, replace=replace)
         result = {
             "user": user,
             "credential_file": str(token_path),

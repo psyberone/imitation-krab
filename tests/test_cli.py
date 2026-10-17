@@ -28,6 +28,7 @@ from imitation_krab.cli import (
     main,
 )
 from imitation_krab.config import CONTAINER_HOST, DEFAULT_HOST, MAX_REQUEST_BYTES
+from imitation_krab.db import Database
 
 
 TOKEN = "krab_usr_" + "a" * 32 + "_" + "b" * 43
@@ -117,8 +118,8 @@ def item_payload() -> dict:
 
 
 class CLIBehaviorTests(unittest.TestCase):
-    def test_release_version_is_0_6_2(self) -> None:
-        self.assertEqual(__version__, "0.6.2")
+    def test_release_version_is_0_6_3(self) -> None:
+        self.assertEqual(__version__, "0.6.3")
 
     def test_api_client_serializes_requests_and_rejects_bad_responses(self) -> None:
         client = APIClient(
@@ -929,6 +930,83 @@ class CLIBehaviorTests(unittest.TestCase):
             self.assertEqual(result, 1)
             self.assertIn("error:", error)
             self.assertIn("already exists", error)
+
+    def test_failed_token_file_delivery_rolls_back_user_and_rotation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database_path = root / "krab.db"
+            token_path = root / "owner.token"
+
+            def invoke(*arguments: str) -> tuple[int, str, str]:
+                stdout = StringIO()
+                stderr = StringIO()
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    result = main(
+                        ["--json", "--db", str(database_path), *arguments]
+                    )
+                return result, stdout.getvalue(), stderr.getvalue()
+
+            self.assertEqual(invoke("init")[0], 0)
+            token_path.write_text("occupied\n", encoding="utf-8")
+            token_path.chmod(0o600)
+            result, _, error = invoke(
+                "admin",
+                "user-create",
+                "owner",
+                "--write-token",
+                str(token_path),
+            )
+            self.assertEqual(result, 1)
+            self.assertIn("refusing to overwrite", error)
+
+            db = Database(database_path)
+            self.assertEqual(db.list_users()["users"], [])
+
+            token_path.unlink()
+            with patch(
+                "imitation_krab.cli.os.write",
+                side_effect=OSError("simulated token write failure"),
+            ):
+                result, _, error = invoke(
+                    "admin",
+                    "user-create",
+                    "owner",
+                    "--write-token",
+                    str(token_path),
+                )
+            self.assertEqual(result, 1)
+            self.assertIn("simulated token write failure", error)
+            self.assertFalse(token_path.exists())
+            self.assertEqual(db.list_users()["users"], [])
+
+            result, _, _ = invoke(
+                "admin",
+                "user-create",
+                "owner",
+                "--write-token",
+                str(token_path),
+            )
+            self.assertEqual(result, 0)
+            original_token = _read_token(token_path)
+            original_actor = db.authenticate(original_token)
+            assert original_actor
+
+            with patch(
+                "imitation_krab.cli._write_token",
+                side_effect=OSError("simulated delivery failure"),
+            ):
+                result, _, error = invoke(
+                    "admin",
+                    "user-rotate",
+                    "owner",
+                    "--write-token",
+                    str(token_path),
+                )
+            self.assertEqual(result, 1)
+            self.assertIn("simulated delivery failure", error)
+            self.assertIsNotNone(db.authenticate(original_token))
+            users = db.list_users()["users"]
+            self.assertEqual(users[0]["trusted_metadata"]["token_version"], 1)
 
     def test_token_files_rotate_atomically_and_reject_unsafe_paths(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

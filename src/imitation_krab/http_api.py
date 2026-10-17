@@ -206,11 +206,12 @@ class KrabRequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "imitation-krab"
     sys_version = ""
+    header_timeout_seconds = 1.0
     server: KrabHTTPServer
 
     def setup(self) -> None:
         super().setup()
-        self.connection.settimeout(15)
+        self.connection.settimeout(self.header_timeout_seconds)
 
     def do_GET(self) -> None:
         self._dispatch("GET")
@@ -282,8 +283,7 @@ class KrabRequestHandler(BaseHTTPRequestHandler):
             )
         except ServiceError as exc:
             status = exc.status
-            if status == 401 or method in {"POST", "PATCH"}:
-                self.close_connection = True
+            self.close_connection = True
             headers = {"Retry-After": "60"} if status == 429 else None
             self._json_response(
                 status,
@@ -293,6 +293,7 @@ class KrabRequestHandler(BaseHTTPRequestHandler):
             )
         except JsonRequestError as exc:
             status = 400
+            self.close_connection = True
             self._json_response(
                 status,
                 self._error("invalid_json", str(exc)),
@@ -653,15 +654,21 @@ class KrabRequestHandler(BaseHTTPRequestHandler):
 
     def _authenticate(self) -> dict[str, Any]:
         peer = self.client_address[0] if self.client_address else "local"
-        if self.server.limiter.limited(peer, "auth_failure", 30):
-            raise ServiceError(429, "rate_limit", "authentication rate limit exceeded")
         header = self.headers.get("Authorization", "")
         if len(header) > 256 or not header.startswith("Bearer "):
+            if self.server.limiter.limited(peer, "auth_failure", 30):
+                raise ServiceError(
+                    429, "rate_limit", "authentication rate limit exceeded"
+                )
             self._record_auth_failure()
             raise ServiceError(401, "unauthorized", "valid bearer token required")
         token = header[7:]
         actor = self.server.database.authenticate(token)
         if actor is None:
+            if self.server.limiter.limited(peer, "auth_failure", 30):
+                raise ServiceError(
+                    429, "rate_limit", "authentication rate limit exceeded"
+                )
             self._record_auth_failure()
             raise ServiceError(401, "unauthorized", "valid bearer token required")
         return actor
@@ -808,6 +815,8 @@ class KrabRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Krab-Version", __version__)
+        if self.close_connection:
+            self.send_header("Connection", "close")
         if request_id:
             self.send_header("X-Request-ID", request_id)
         if status == 401:

@@ -26,6 +26,20 @@ package dependencies beyond Python 3.11 or newer. Its explicit container mode
 binds the container namespace while the supplied Compose deployment publishes
 the API only on host loopback.
 
+## Release 0.6.3
+
+Version 0.6.3 is a bounded hardening release with no database migration or new
+API surface. Token rotation and user disablement now revoke in-flight long
+polls before they can return another delivery. Valid credentials are no longer
+blocked by the shared failed-authentication throttle, rejected requests close
+their HTTP connection, and incomplete request headers have a one-second
+deadline.
+
+Local inventory opens existing state read-only, and backup neither initializes
+nor migrates its source. An existing database with a missing pepper now fails
+closed instead of silently generating a replacement. When `--write-token`
+delivery fails, user creation or rotation rolls back with it.
+
 ## Release 0.6.2
 
 Version 0.6.2 removes semantic screening of authenticated participants'
@@ -44,6 +58,16 @@ and pull-request assignments. Mutation idempotency keys may appear before the
 command or after the mutation subcommand. Every HTTP response carries an
 `X-Krab-Version` header so the CLI can report version skew without changing
 machine-readable stdout.
+
+## 0.7 inclusion candidates
+
+Version 0.7 is reserved for the bounded Magic Glass Box feature release. The
+following audit follow-ups remain candidates, not commitments: project-admin
+session lifecycle corrections, disabled-user recovery, response-schema
+completion, CLI/HTTP consistency, audit-history completion, and remaining
+state-directory hardening. A candidate enters 0.7 only when it directly
+supports that integration, closes a meaningful correctness gap, or is a
+small low-risk hardening change.
 
 ## Security boundary
 
@@ -207,7 +231,8 @@ Backup names must be new; the command never overwrites. The resulting file is
 mode `0600`, uses rollback-journal format, and can safely be copied out of the
 backup volume after the command completes. It contains plaintext message data,
 so encrypt exported copies and manage their retention. Do not copy the live
-data volume.
+data volume. Backup opens an existing source read-only and preserves its schema
+version; it never creates or upgrades the source database.
 
 `docker compose down` removes containers and the network but retains state.
 For a complete, irreversible reset, activate the admin profile so Compose also
@@ -252,13 +277,14 @@ krab --json admin project-members imitation-krab
 
 These read-only commands include stable identifiers, handles, active state,
 roles, and token versions where applicable. They never return bearer tokens or
-token digests. Identity and membership mutations remain local-only; there is
-no administrative HTTP API.
+token digests, create missing state, or migrate an older schema. Identity and
+membership mutations remain local-only; there is no administrative HTTP API.
 
 Token files are created with mode `0600`. The CLI refuses symlinked or
 hard-linked token files, non-owned files, group/world-accessible files, and
 token directories not owned by the current user with mode `0700`. If
-`--write-token` is omitted, the token is printed exactly once.
+`--write-token` is omitted, the token is printed exactly once. A failed token
+file write rolls back the associated user creation or credential rotation.
 
 Project roles are deliberately fixed:
 
@@ -696,6 +722,7 @@ GitHub or permission to perform any external action.
 ## Limits
 
 - Request body: 32 KiB
+- Incomplete request headers: 1-second connection deadline
 - Work-item body: 16 KiB
 - Status note: 4 KiB
 - Title: 512 UTF-8 bytes

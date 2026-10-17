@@ -9,6 +9,7 @@ import re
 import secrets
 import sqlite3
 import stat
+from collections.abc import Callable
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
@@ -438,7 +439,7 @@ class Database:
 
     def initialize(self) -> None:
         self._ensure_private_parent(self.path.parent)
-        self._ensure_pepper()
+        self._ensure_pepper(allow_create=not self.path.exists())
         self._reject_symlink(self.path, allow_missing=True)
         conn = self.connect(initialize=False)
         try:
@@ -491,6 +492,53 @@ class Database:
             if initialize:
                 self._migrate_schema(conn)
             return conn
+        except Exception:
+            conn.close()
+            raise
+
+    def connect_read_only(
+        self, *, require_current_schema: bool = True
+    ) -> sqlite3.Connection:
+        """Open existing state without creating files or migrating its schema."""
+        try:
+            self._reject_symlink(self.path, allow_missing=False)
+        except FileNotFoundError as exc:
+            raise DatabaseError(f"database does not exist: {self.path}") from exc
+        info = self.path.stat()
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            raise DatabaseError("database file is not owned by the current user")
+        if info.st_mode & 0o077:
+            raise DatabaseError(
+                "database file must not be accessible by group or other users"
+            )
+        if info.st_nlink != 1:
+            raise DatabaseError("database file must not be hard-linked")
+
+        uri = self.path.resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(
+            uri,
+            uri=True,
+            timeout=5.0,
+            isolation_level=None,
+        )
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA busy_timeout = 5000")
+            conn.execute("PRAGMA trusted_schema = OFF")
+            conn.execute("PRAGMA query_only = ON")
+            rows = conn.execute("SELECT version FROM schema_meta").fetchall()
+            if len(rows) != 1 or not isinstance(rows[0]["version"], int):
+                raise DatabaseError("database schema metadata is invalid")
+            version = rows[0]["version"]
+            if require_current_schema and version != SCHEMA_VERSION:
+                raise DatabaseError(
+                    f"database schema version {version} requires explicit migration"
+                )
+            return conn
+        except sqlite3.OperationalError as exc:
+            conn.close()
+            raise DatabaseError("database schema metadata is missing") from exc
         except Exception:
             conn.close()
             raise
@@ -600,7 +648,7 @@ class Database:
         source: sqlite3.Connection | None = None
         target: sqlite3.Connection | None = None
         try:
-            source = self.connect()
+            source = self.connect_read_only(require_current_schema=False)
             target = sqlite3.connect(target_path, timeout=5.0, isolation_level=None)
             target.execute("PRAGMA trusted_schema = OFF")
             source.backup(target, pages=256, sleep=0.05)
@@ -652,7 +700,12 @@ class Database:
                     artifact.unlink()
             raise
 
-    def create_user(self, handle: str) -> tuple[dict[str, Any], str]:
+    def create_user(
+        self,
+        handle: str,
+        *,
+        token_delivery: Callable[[str], None] | None = None,
+    ) -> tuple[dict[str, Any], str]:
         handle = validate_handle(handle)
         user_id = self.new_id("usr")
         token = self._new_token(user_id)
@@ -669,15 +722,25 @@ class Database:
                 (user_id, handle, digest, now, now),
             )
             self._audit(conn, None, "user.created", user_id, {"handle": handle})
+            if token_delivery is not None:
+                token_delivery(token)
             conn.commit()
         except sqlite3.IntegrityError as exc:
             conn.rollback()
             raise DatabaseError("user handle already exists") from exc
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
         return {"id": user_id, "handle": handle, "active": True}, token
 
-    def rotate_user_token(self, handle: str) -> tuple[dict[str, Any], str]:
+    def rotate_user_token(
+        self,
+        handle: str,
+        *,
+        token_delivery: Callable[[str], None] | None = None,
+    ) -> tuple[dict[str, Any], str]:
         handle = validate_handle(handle)
         conn = self.connect()
         try:
@@ -707,6 +770,8 @@ class Database:
                 row["id"],
                 {"token_version": row["token_version"] + 1},
             )
+            if token_delivery is not None:
+                token_delivery(token)
             conn.commit()
             return {"id": row["id"], "handle": handle, "active": True}, token
         except Exception:
@@ -740,7 +805,7 @@ class Database:
             conn.close()
 
     def list_users(self) -> dict[str, Any]:
-        conn = self.connect()
+        conn = self.connect_read_only()
         try:
             rows = conn.execute(
                 """
@@ -768,7 +833,7 @@ class Database:
         }
 
     def list_projects_inventory(self) -> dict[str, Any]:
-        conn = self.connect()
+        conn = self.connect_read_only()
         try:
             rows = conn.execute(
                 """
@@ -795,7 +860,7 @@ class Database:
 
     def list_project_members(self, project_key: str) -> dict[str, Any]:
         project_key = validate_project_key(project_key)
-        conn = self.connect()
+        conn = self.connect_read_only()
         try:
             project = conn.execute(
                 "SELECT id, project_key, label FROM projects WHERE project_key = ?",
@@ -973,7 +1038,9 @@ class Database:
             self._read_pepper(), token.encode("utf-8"), hashlib.sha256
         ).digest()
 
-    def _ensure_pepper(self) -> None:
+    def _ensure_pepper(self, *, allow_create: bool = True) -> None:
+        if not allow_create and not self.pepper_path.exists():
+            raise DatabaseError("pepper file is missing for existing database")
         self._ensure_private_parent(self.pepper_path.parent)
         self._reject_symlink(self.pepper_path, allow_missing=True)
         if not self.pepper_path.exists():
@@ -993,7 +1060,7 @@ class Database:
         os.chmod(self.pepper_path, 0o600)
 
     def _read_pepper(self) -> bytes:
-        self._ensure_pepper()
+        self._ensure_pepper(allow_create=not self.path.exists())
         flags = os.O_RDONLY
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW

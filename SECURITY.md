@@ -116,7 +116,7 @@ content.
 | --- | --- |
 | Unauthenticated local process | 256-bit bearer credentials, constant-time digest comparison, generic authentication errors |
 | Stolen database | Token digests are keyed with a separate 256-bit pepper; raw tokens are never stored |
-| Stolen bearer token | Per-user least privilege, immediate rotation/revocation, project/session membership, rate limits |
+| Stolen bearer token | Per-user least privilege, immediate rotation/revocation including in-flight long polls, project/session membership, rate limits |
 | Cross-project or cross-session access | Scoped route checks plus composite SQLite foreign keys |
 | Sender impersonation | Sender always comes from authentication; no accepted `sender_id` field |
 | Work-item bait-and-switch | Delivered title/body/scope/parties are immutable |
@@ -135,7 +135,7 @@ content.
 | Newest-page queue disclosure | Identical delivery/session authorization and event serializer as forward queue reads; fixed page cap; no long-poll combination |
 | Project activity overexposure | Active project-membership check, explicit SQL column selection, dedicated allowlist serializer, title-only untrusted text, no delivery body/note/history/risk fields |
 | Lost or forged read position | Explicit per-user/project monotonic acknowledgement bounded by the highest event delivered to that same user |
-| Queue flooding | Request throttles, per-user long-poll concurrency, participant/session/event limits, message-size limits, per-route open-item cap, and database-size cap |
+| Queue or connection flooding | One-second incomplete-header deadline, request throttles, per-user long-poll concurrency, participant/session/event limits, message-size limits, per-route open-item cap, and database-size cap |
 | Terminal/log injection | Dangerous controls rejected on ingress; console escapes again on output; structured logs omit bodies |
 | JSON ambiguity | Strict UTF-8, body cap, duplicate-key rejection, finite JSON numbers, unknown-field rejection |
 | Unicode identity spoofing | Handles, project keys, IDs, statuses, and idempotency keys use restricted ASCII |
@@ -171,7 +171,10 @@ Tokens have the form `krab_usr_<opaque-id>_<256-bit-secret>`. The public user ID
 allows direct lookup; the whole token is verified using HMAC-SHA-256 with a
 server pepper. Tokens are displayed once or written to a new mode-`0600` file
 inside an owned mode-`0700` directory. The client refuses token symlinks, hard
-links, non-owned files, and group/world-readable files.
+links, non-owned files, and group/world-readable files. File delivery occurs
+inside the identity transaction, so a failed write rolls back creation or
+rotation. If an existing database has no pepper, startup fails closed; Krab
+does not manufacture a replacement that would invalidate every token.
 
 Token possession is authentication. If multiple agents run under the same OS
 account with unrestricted filesystem or process access, they may be able to
@@ -213,8 +216,17 @@ checks limit other users' data, not that user's own blast radius.
   can send security discussions, URLs, prompts, and command names unchanged;
   recipients apply any workflow-specific policy outside the mailbox.
 - A fully compromised daemon account or host can alter state and credentials.
+- The one-second incomplete-header deadline bounds how long one idle connection
+  occupies a request slot. It does not make the daemon immune to a hostile local
+  process that continuously opens new sockets; OS/container isolation remains
+  the boundary for that process.
 - A compromised authenticated agent can perform every operation granted to its
   identity until the token is revoked.
+- `--write-token` performs file delivery before committing the SQLite identity
+  transaction, so a file-write failure rolls the database change back. SQLite
+  and the filesystem cannot form one atomic transaction; if the later database
+  commit itself fails after a successful file replacement, an operator must
+  retry credential rotation and delivery.
 - The claim registry does not authenticate to, query, or synchronize with
   GitHub. Import accepts only a caller-supplied identifier manifest and is not
   synchronization: duplicate spellings or stale external state are an
@@ -249,7 +261,8 @@ checks limit other users' data, not that user's own blast radius.
   is cooperative outside the database.
 - SQLite files must not be copied live as an ad hoc backup while WAL mode is in
   use. Stop the daemon or use the `admin backup` command, which uses SQLite's
-  online backup API and verifies the resulting snapshot.
+  online backup API and verifies the resulting snapshot without initializing or
+  migrating its source.
 
 ## Verification expectations
 
@@ -260,3 +273,8 @@ unchanged prose delivery, immutable content and work links, queue privacy,
 atomic claim ownership, coordinator/admin creation and assignment boundaries, additive
 import behavior, independent review and self-approval denial, exact scoped
 claim filters, release boundaries, and reminder throttling.
+Credential revocation must also cover in-flight long polls; failed-authentication
+throttling must not reject a valid credential; pepper loss must fail closed;
+inventory and backup must not create or migrate source state; rejected request
+bodies must close their connection; and token-file delivery failures must roll
+back their identity mutation.

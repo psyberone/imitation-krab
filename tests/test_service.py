@@ -1285,6 +1285,71 @@ class ServiceTests(ServiceFixture):
             created["trusted_metadata"]["event_seq"],
         )
 
+    def test_rotation_revokes_every_in_flight_long_poll_before_delivery(self) -> None:
+        readers = (
+            lambda: self.service.get_queue(
+                self.bob,
+                "project-one",
+                self.session_id,
+                after=0,
+                wait=2,
+            ),
+            lambda: self.service.get_project_inbox(
+                self.bob,
+                "project-one",
+                after=0,
+                wait=2,
+            ),
+            lambda: self.service.get_project_activity(
+                self.bob,
+                "project-one",
+                after=0,
+                wait=2,
+            ),
+        )
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            waiting = [pool.submit(reader) for reader in readers]
+            threading.Event().wait(0.1)
+            _, replacement = self.db.rotate_user_token("bob")
+            created = self.create_item(key="post-rotation-item-0001").payload
+            for future in waiting:
+                with self.assertRaises(ServiceError) as caught:
+                    future.result(timeout=3)
+                self.assertEqual(caught.exception.status, 401)
+                self.assertEqual(caught.exception.code, "unauthorized")
+
+        rotated_actor = self.db.authenticate(replacement)
+        assert rotated_actor
+        queue = self.service.get_queue(
+            rotated_actor,
+            "project-one",
+            self.session_id,
+            after=0,
+        )
+        self.assertEqual(
+            queue["events"][0]["trusted_metadata"]["event_seq"],
+            created["trusted_metadata"]["event_seq"],
+        )
+
+    def test_disable_revokes_an_in_flight_long_poll(self) -> None:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            waiting = pool.submit(
+                self.service.get_queue,
+                self.bob,
+                "project-one",
+                self.session_id,
+                after=0,
+                wait=2,
+            )
+            threading.Event().wait(0.1)
+            self.db.disable_user("bob")
+            with self.assertRaises(ServiceError) as caught:
+                waiting.result(timeout=1)
+
+        self.assertEqual(caught.exception.status, 401)
+        self.assertEqual(caught.exception.code, "unauthorized")
+
     def test_online_backup_is_private_consistent_and_never_overwrites(self) -> None:
         backup_path = Path(self.temporary.name) / "backups" / "krab.db"
         result = self.db.backup(backup_path)
@@ -1318,6 +1383,65 @@ class ServiceTests(ServiceFixture):
         ):
             self.db.backup(failed_path)
         self.assertFalse(failed_path.exists())
+
+    def test_backup_preserves_legacy_source_schema_without_migrating(self) -> None:
+        backup_path = Path(self.temporary.name) / "legacy-backup.db"
+        with closing(sqlite3.connect(self.db.path)) as conn:
+            conn.execute("DROP INDEX idx_events_project_seq")
+            conn.execute("UPDATE schema_meta SET version = 5")
+            conn.commit()
+
+        self.db.backup(backup_path)
+
+        for path in (self.db.path, backup_path):
+            with self.subTest(path=path), closing(sqlite3.connect(path)) as conn:
+                self.assertEqual(
+                    conn.execute("SELECT version FROM schema_meta").fetchone()[0],
+                    5,
+                )
+                self.assertIsNone(
+                    conn.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type = 'index' AND name = 'idx_events_project_seq'"
+                    ).fetchone()
+                )
+
+    def test_missing_pepper_fails_closed_without_replacement(self) -> None:
+        self.db.pepper_path.unlink()
+
+        with self.assertRaisesRegex(DatabaseError, "pepper.*missing"):
+            self.db.authenticate(self.alice_token)
+
+        self.assertFalse(self.db.pepper_path.exists())
+
+    def test_inventory_and_backup_do_not_create_or_migrate_source_state(self) -> None:
+        root = Path(self.temporary.name) / "read-only"
+        missing = Database(root / "missing.db", root / "missing.pepper")
+        operations = (
+            lambda: missing.list_users(),
+            lambda: missing.list_projects_inventory(),
+            lambda: missing.list_project_members("project-one"),
+            lambda: missing.backup(root / "missing-backup.db"),
+        )
+        for operation in operations:
+            with self.subTest(operation=operation), self.assertRaisesRegex(
+                DatabaseError, "database.*does not exist"
+            ):
+                operation()
+        self.assertFalse(missing.path.exists())
+        self.assertFalse(missing.pepper_path.exists())
+        self.assertFalse((root / "missing-backup.db").exists())
+
+        with closing(sqlite3.connect(self.db.path)) as conn:
+            conn.execute("DROP INDEX idx_events_project_seq")
+            conn.execute("UPDATE schema_meta SET version = 5")
+            conn.commit()
+        with self.assertRaisesRegex(DatabaseError, "schema version 5"):
+            self.db.list_users()
+        with closing(sqlite3.connect(self.db.path)) as conn:
+            self.assertEqual(
+                conn.execute("SELECT version FROM schema_meta").fetchone()[0], 5
+            )
 
     def test_private_scoped_delivery_does_not_classify_agent_prose(self) -> None:
         body = (
@@ -1671,7 +1795,10 @@ class DatabaseMigrationTests(unittest.TestCase):
                 conn.commit()
             database_path.chmod(0o600)
 
-            database = Database(database_path, root / "pepper.key")
+            pepper_path = root / "pepper.key"
+            pepper_path.write_bytes(b"p" * 32)
+            pepper_path.chmod(0o600)
+            database = Database(database_path, pepper_path)
             database.initialize()
             conn = database.connect()
             try:
@@ -1746,7 +1873,10 @@ class DatabaseMigrationTests(unittest.TestCase):
                 conn.commit()
             database_path.chmod(0o600)
 
-            database = Database(database_path, root / "pepper.key")
+            pepper_path = root / "pepper.key"
+            pepper_path.write_bytes(b"p" * 32)
+            pepper_path.chmod(0o600)
+            database = Database(database_path, pepper_path)
             database.initialize()
             conn = database.connect()
             try:
@@ -1826,7 +1956,10 @@ class DatabaseMigrationTests(unittest.TestCase):
                 conn.commit()
             database_path.chmod(0o600)
 
-            database = Database(database_path, root / "pepper.key")
+            pepper_path = root / "pepper.key"
+            pepper_path.write_bytes(b"p" * 32)
+            pepper_path.chmod(0o600)
+            database = Database(database_path, pepper_path)
             database.initialize()
             conn = database.connect()
             try:

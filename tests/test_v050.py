@@ -425,7 +425,10 @@ class V050MigrationTests(unittest.TestCase):
                 conn.commit()
             path.chmod(0o600)
 
-            database = Database(path, root / "pepper.key")
+            pepper_path = root / "pepper.key"
+            pepper_path.write_bytes(b"p" * 32)
+            pepper_path.chmod(0o600)
+            database = Database(path, pepper_path)
             database.initialize()
             with closing(database.connect()) as conn:
                 self.assertEqual(
@@ -514,7 +517,10 @@ class V050MigrationTests(unittest.TestCase):
                 conn.commit()
             path.chmod(0o600)
 
-            database = Database(path, root / "pepper.key")
+            pepper_path = root / "pepper.key"
+            pepper_path.write_bytes(b"p" * 32)
+            pepper_path.chmod(0o600)
+            database = Database(path, pepper_path)
             database.initialize()
             with closing(database.connect()) as conn:
                 self.assertEqual(

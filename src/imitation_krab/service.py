@@ -1715,6 +1715,7 @@ class Service:
         while True:
             conn = self.db.connect()
             try:
+                self._require_current_actor(conn, actor)
                 project = self._project_membership(conn, actor["id"], project_key)
                 self._session_membership(conn, actor["id"], project["id"], session_id)
                 query = """
@@ -1752,6 +1753,8 @@ class Service:
             if rows or time.monotonic() >= deadline:
                 break
             time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+
+        self._revalidate_actor(actor)
 
         events = [self._serialize_queue_event(row, project_key) for row in rows]
         metadata = {
@@ -1818,6 +1821,7 @@ class Service:
         while True:
             conn = self.db.connect()
             try:
+                self._require_current_actor(conn, actor)
                 project = self._project_membership(conn, actor["id"], project_key)
                 cursor = conn.execute(
                     """
@@ -1866,6 +1870,8 @@ class Service:
             if rows or time.monotonic() >= deadline:
                 break
             time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+
+        self._revalidate_actor(actor)
 
         return {
             "trusted_metadata": {
@@ -1916,6 +1922,7 @@ class Service:
         while True:
             conn = self.db.connect()
             try:
+                self._require_current_actor(conn, actor)
                 project = self._project_membership(conn, actor["id"], project_key)
                 rows = conn.execute(
                     """
@@ -1959,6 +1966,8 @@ class Service:
             if rows or time.monotonic() >= deadline:
                 break
             time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+
+        self._revalidate_actor(actor)
 
         return {
             "trusted_metadata": {
@@ -2060,6 +2069,28 @@ class Service:
         except Exception:
             conn.rollback()
             raise
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _require_current_actor(
+        conn: sqlite3.Connection, actor: dict[str, Any]
+    ) -> None:
+        row = conn.execute(
+            "SELECT active, token_version FROM users WHERE id = ?",
+            (actor["id"],),
+        ).fetchone()
+        if (
+            row is None
+            or not row["active"]
+            or row["token_version"] != actor["token_version"]
+        ):
+            raise ServiceError(401, "unauthorized", "credential is no longer valid")
+
+    def _revalidate_actor(self, actor: dict[str, Any]) -> None:
+        conn = self.db.connect()
+        try:
+            self._require_current_actor(conn, actor)
         finally:
             conn.close()
 

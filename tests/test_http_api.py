@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import http.client
 import json
 import signal
 import socket
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -16,6 +18,7 @@ from imitation_krab.db import Database
 from imitation_krab.http_api import (
     ConcurrentLimiter,
     JsonRequestError,
+    KrabHTTPServer,
     KrabRequestHandler,
     SlidingWindowLimiter,
     decode_json_object,
@@ -239,6 +242,106 @@ class HTTPAPITests(unittest.TestCase):
         status, health, health_headers = self.request("GET", "/v1/health", None)
         self.assertEqual((status, health), (200, {"status": "ok"}))
         self.assertEqual(health_headers["x-krab-version"], __version__)
+
+    def test_valid_token_bypasses_shared_failed_authentication_bucket(self) -> None:
+        for _ in range(30):
+            self.assertTrue(
+                self.server.limiter.allow("local", "auth_failure", 30)
+            )
+
+        status, projects, _ = self.request(
+            "GET", "/v1/projects", self.alice_token
+        )
+        self.assertEqual(status, 200, projects)
+
+        invalid = "krab_usr_" + "f" * 32 + "_" + "x" * 43
+        status, rejected, headers = self.request("GET", "/v1/projects", invalid)
+        self.assertEqual(status, 429, rejected)
+        self.assertEqual(rejected["error"]["code"], "rate_limit")
+        self.assertEqual(headers["retry-after"], "60")
+
+    def test_rejected_get_body_closes_connection_before_queued_bytes(self) -> None:
+        queued = (
+            b"GET /v1/health HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Connection: close\r\n\r\n"
+        )
+        request = (
+            b"GET /v1/projects HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            + f"Authorization: Bearer {self.alice_token}\r\n".encode("ascii")
+            + f"Content-Length: {len(queued)}\r\n\r\n".encode("ascii")
+            + queued
+        )
+        server_socket, client_socket = socket.socketpair()
+        client_socket.settimeout(3)
+
+        def handle_request() -> None:
+            try:
+                KrabRequestHandler(server_socket, ("local", 0), self.server)
+            finally:
+                server_socket.close()
+
+        thread = threading.Thread(target=handle_request, daemon=True)
+        thread.start()
+        try:
+            client_socket.sendall(request)
+            chunks: list[bytes] = []
+            while True:
+                chunk = client_socket.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        finally:
+            client_socket.close()
+            server_socket.close()
+            thread.join(timeout=2)
+
+        raw_response = b"".join(chunks)
+        self.assertEqual(raw_response.count(b"HTTP/1.1 "), 1, raw_response)
+        self.assertIn(b" 400 ", raw_response.split(b"\r\n", 1)[0])
+        self.assertIn(b"Connection: close\r\n", raw_response)
+        self.assertNotIn(b'{"status":"ok"}', raw_response)
+
+    def test_idle_connections_release_request_slots_after_header_deadline(self) -> None:
+        self.assertLessEqual(KrabRequestHandler.header_timeout_seconds, 1.0)
+        with mock.patch.object(
+            KrabRequestHandler,
+            "header_timeout_seconds",
+            0.1,
+            create=True,
+        ):
+            server = KrabHTTPServer(("127.0.0.1", 0), self.db)
+            serving = threading.Thread(target=server.serve_forever, daemon=True)
+            serving.start()
+            idle: list[socket.socket] = []
+            try:
+                for _ in range(32):
+                    connection = socket.create_connection(server.server_address, timeout=1)
+                    idle.append(connection)
+                time.sleep(0.25)
+
+                connection = http.client.HTTPConnection(
+                    *server.server_address,
+                    timeout=2,
+                )
+                try:
+                    connection.request(
+                        "GET",
+                        "/v1/health",
+                        headers={"Host": "localhost", "Connection": "close"},
+                    )
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(json.loads(response.read()), {"status": "ok"})
+                finally:
+                    connection.close()
+            finally:
+                for connection in idle:
+                    connection.close()
+                server.shutdown()
+                server.server_close()
+                serving.join(timeout=2)
 
     def test_whoami_returns_stable_identity_across_credential_rotation(self) -> None:
         status, discovered, _ = self.request("GET", "/v1/whoami", self.alice_token)
