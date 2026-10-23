@@ -65,26 +65,62 @@ SERVER_VERSION_RE = re.compile(r"\A[0-9A-Za-z][0-9A-Za-z.+-]{0,63}\Z")
 WATCH_RETRY_SECONDS = (1, 2, 4, 8, 15)
 
 
+def _server_address(base_url: str) -> tuple[str, int]:
+    parsed = urlsplit(base_url)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "localhost"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ClientError(
+            "server URL must be an HTTP loopback origin without credentials or a path"
+        )
+    try:
+        port = parsed.port or DEFAULT_PORT
+    except ValueError as exc:
+        raise ClientError("server URL contains an invalid port") from exc
+    return parsed.hostname, port
+
+
+def _health_request(base_url: str) -> dict[str, Any]:
+    host, port = _server_address(base_url)
+    connection = http.client.HTTPConnection(host, port, timeout=5)
+    try:
+        connection.request("GET", "/v1/health", headers={
+            "Accept": "application/json",
+            "User-Agent": f"imitation-krab/{__version__}",
+        })
+        response = connection.getresponse()
+        if response.status != 200:
+            raise ClientError(f"health check failed: HTTP {response.status}")
+        raw = response.read(MAX_REQUEST_BYTES + 1)
+        version = response.getheader("X-Krab-Version")
+    except (OSError, TimeoutError, http.client.HTTPException) as exc:
+        raise ServerUnavailable(f"server unavailable: {exc}") from None
+    finally:
+        connection.close()
+    if len(raw) > MAX_REQUEST_BYTES:
+        raise ClientError("server returned an oversized health response")
+    try:
+        result = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise ClientError("server returned invalid health JSON") from exc
+    if not isinstance(result, dict) or result.get("status") != "ok":
+        raise ClientError("server returned an unexpected health response")
+    if version is not None and (
+        not isinstance(version, str) or not SERVER_VERSION_RE.fullmatch(version)
+    ):
+        raise ClientError("server returned an invalid Krab version")
+    return {"status": "ok", "server_version": version}
+
+
 class APIClient:
     def __init__(self, base_url: str, token: str, idempotency_key: str | None = None):
-        parsed = urlsplit(base_url)
-        if (
-            parsed.scheme != "http"
-            or parsed.hostname not in {"127.0.0.1", "localhost"}
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.path not in {"", "/"}
-            or parsed.query
-            or parsed.fragment
-        ):
-            raise ClientError(
-                "server URL must be an HTTP loopback origin without credentials or a path"
-            )
-        try:
-            self.port = parsed.port or DEFAULT_PORT
-        except ValueError as exc:
-            raise ClientError("server URL contains an invalid port") from exc
-        self.host = parsed.hostname
+        self.host, self.port = _server_address(base_url)
         self.token = token
         self.idempotency_key = idempotency_key
         self.server_version: str | None = None
@@ -208,6 +244,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init", help="initialize the private database and pepper")
+
+    health = sub.add_parser("health", help="check daemon health without credentials")
+    health.add_argument(
+        "--json", action="store_true", default=argparse.SUPPRESS,
+        help="print machine-readable JSON",
+    )
 
     serve_parser = sub.add_parser("serve", help="run the local daemon")
     serve_parser.add_argument("--host", default=DEFAULT_HOST, choices=[DEFAULT_HOST])
@@ -452,9 +494,17 @@ def _add_text_source(
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    pepper_path = args.pepper_file or default_pepper_path(args.db)
-    database = Database(args.db, pepper_path)
     try:
+        if args.command == "health":
+            result = _health_request(args.server)
+            if args.json:
+                _emit(args, result)
+            else:
+                print(f"ok (server {result['server_version'] or 'unknown'})")
+            return 0
+
+        pepper_path = args.pepper_file or default_pepper_path(args.db)
+        database = Database(args.db, pepper_path)
         if args.command == "init":
             database.initialize()
             _emit(args, {"database": str(database.path), "initialized": True})

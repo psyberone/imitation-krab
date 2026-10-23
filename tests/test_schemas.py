@@ -30,6 +30,7 @@ class SchemaFileTests(unittest.TestCase):
             "claim-list.schema.json",
             "claim.schema.json",
             "error.schema.json",
+            "health.schema.json",
             "inbox-ack.schema.json",
             "item.schema.json",
             "my-claims.schema.json",
@@ -105,6 +106,26 @@ class ResponseSchemaTests(unittest.TestCase):
         schema = self.schemas[schema_name]
         Draft202012Validator.check_schema(schema)
         Draft202012Validator(schema, registry=self.registry).validate(instance)
+
+    def test_health_response_schema(self) -> None:
+        for version in (None, "0.6.3", "0.7.0-beta+1", "a" * 64):
+            with self.subTest(version=version):
+                self.validate("health.schema.json", {
+                    "status": "ok", "server_version": version,
+                })
+        invalid = [
+            {}, {"status": "ok"}, {"server_version": None},
+            {"status": "down", "server_version": None},
+            {"status": "ok", "server_version": None, "extra": True},
+        ]
+        invalid.extend(
+            {"status": "ok", "server_version": version}
+            for version in ("", "a" * 65, "0.6.3\n", "evil\x1b[31m", 3)
+        )
+        validator = Draft202012Validator(self.schemas["health.schema.json"])
+        for payload in invalid:
+            with self.subTest(payload=payload):
+                self.assertFalse(validator.is_valid(payload))
 
     def test_live_service_responses_match_the_catalog(self) -> None:
         self.validate("whoami.schema.json", self.service.whoami(self.alice))

@@ -3,11 +3,14 @@
 `v1/` describes the stable response envelopes returned by the `/v1` API in
 Krab 0.6.x. User-controlled prose is always under `untrusted_text`; identities,
 routing, versions, timestamps, and sequence numbers are under
-`trusted_metadata`.
+`trusted_metadata`. The `health --json` CLI liveness response is an exception:
+it contains top-level `status` and `server_version` fields, with the latter
+taken from the validated response header (or `null` for legacy servers).
 
 | Response | Schema |
 | --- | --- |
 | Errors | `v1/error.schema.json` |
+| `health --json` (CLI output, not the raw `GET /v1/health` body) | `v1/health.schema.json` |
 | `GET /v1/whoami` | `v1/whoami.schema.json` |
 | `projects` | `v1/project-list.schema.json` |
 | `sessions` / `session-create` | `v1/session-list.schema.json`, `v1/session.schema.json` |
