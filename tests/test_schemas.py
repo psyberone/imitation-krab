@@ -108,7 +108,7 @@ class ResponseSchemaTests(unittest.TestCase):
         Draft202012Validator(schema, registry=self.registry).validate(instance)
 
     def test_health_response_schema(self) -> None:
-        for version in (None, "0.6.3", "0.7.0-beta+1", "a" * 64):
+        for version in (None, "0.6.4", "0.7.0-beta+1", "a" * 64):
             with self.subTest(version=version):
                 self.validate("health.schema.json", {
                     "status": "ok", "server_version": version,
@@ -120,7 +120,7 @@ class ResponseSchemaTests(unittest.TestCase):
         ]
         invalid.extend(
             {"status": "ok", "server_version": version}
-            for version in ("", "a" * 65, "0.6.3\n", "evil\x1b[31m", 3)
+            for version in ("", "a" * 65, "0.6.4\n", "evil\x1b[31m", 3)
         )
         validator = Draft202012Validator(self.schemas["health.schema.json"])
         for payload in invalid:

@@ -26,6 +26,14 @@ package dependencies beyond Python 3.11 or newer. Its explicit container mode
 binds the container namespace while the supplied Compose deployment publishes
 the API only on host loopback.
 
+## Release 0.6.4
+
+Version 0.6.4 adds a bounded, credential-free `krab health` liveness probe for
+local supervisors and orchestration tools. It provides one-line human output
+or schema-backed JSON, reports the validated server version, and does not open
+local state or read a token. This release has no database migration or new
+server API surface.
+
 ## Release 0.6.3
 
 Version 0.6.3 is a bounded hardening release with no database migration or new
@@ -156,7 +164,7 @@ This checks only that the daemon responds to the health endpoint. It does not
 establish database readiness, authentication, project access, or overall
 operability; it is not a readiness probe.
 
-On success, JSON contains `{"status":"ok","server_version":"0.6.3"}`,
+On success, JSON contains `{"status":"ok","server_version":"0.6.4"}`,
 as defined by [`schemas/v1/health.schema.json`](schemas/v1/health.schema.json).
 `server_version` is the validated `X-Krab-Version` response header, or `null`
 for legacy servers that omit it. The probe honors `KRAB_SERVER` and `--server`,

@@ -118,8 +118,8 @@ def item_payload() -> dict:
 
 
 class CLIBehaviorTests(unittest.TestCase):
-    def test_release_version_is_0_6_3(self) -> None:
-        self.assertEqual(__version__, "0.6.3")
+    def test_release_version_is_0_6_4(self) -> None:
+        self.assertEqual(__version__, "0.6.4")
 
     def test_api_client_serializes_requests_and_rejects_bad_responses(self) -> None:
         client = APIClient(
