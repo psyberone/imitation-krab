@@ -235,7 +235,7 @@ docker compose ps
 curl --fail --silent http://127.0.0.1:8765/v1/health
 ```
 
-New images migrate an existing schema 1 through 5 database to schema 6 at
+New images migrate an existing schema 1 through 6 database to schema 7 at
 startup without deleting users, projects, sessions, messages, or claims. Take
 a verified backup before updating, then rebuild and recreate the service
 container:
@@ -646,6 +646,33 @@ The recipient starts and submits work. The creator reviews, requests changes,
 approves, and closes approved work. Either party may reject only in the states
 allowed by the server. `needs-changes` and `closed-rejected` require a note.
 
+Items have an immutable `completion_policy`: `workflow` (the default for omitted
+values and every migrated item) or `receipt`. The state machine above applies
+only to workflow items. A receipt item has exactly one transition:
+`open.pending` → `closed.handled`, authorized only for its authenticated
+recipient. Creators cannot withdraw receipt items. Receipt items cannot enter
+workflow states; workflow items cannot enter `closed.handled`.
+
+Use `send --completion-policy receipt` to send a receipt item, then
+`status ITEM handled --expected-version VERSION` with the usual project and
+session scope to handle it. The HTTP creation payload accepts the optional
+`completion_policy` field (`workflow` or `receipt`); the existing status endpoint
+accepts `{"status":"closed.handled","expected_version":1}`. Handling uses the
+normal idempotency key, optimistic version check, event, and creator delivery.
+No note is required. Explicitly handle, then acknowledge the inbox separately:
+reading, polling, replying, and `inbox-ack` do not handle an item.
+
+Linked claims retain their independent lifecycle. Atomic `claim-review` verdict
+notifications use receipt policy because the claim owns the review workflow.
+Item, queue, inbox, and activity metadata expose effective `completion_policy`.
+The per-creator/recipient/session route bound remains 100 open items, shared by
+both policies. A creator's `queue_limit` error includes only
+`details: {"limit":100,"open_items":100}`; handling frees a route slot.
+
+Schema 7 rebuilds the items table transactionally, preserving IDs, versions,
+claim links, indexes, triggers, history, and deliveries. Foreign-key integrity is
+checked before commit; a failed migration rolls back the schema and data.
+
 Every update includes the version last observed by the caller:
 
 ```console
@@ -784,6 +811,13 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 The suite exercises the service and complete HTTP handler through local socket
 pairs, so it does not require permission to bind a network port.
+
+Focused receipt-policy authority, migration, and lifecycle checks (also suitable
+for an operator's focused mutation run):
+
+```console
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src:tests python3 -m unittest test_receipt test_v050.V050ServiceTests.test_review_verdict_is_atomic_idempotent_and_has_round_history -v
+```
 
 Coverage is measured with branch tracking and must remain at or above 85%:
 

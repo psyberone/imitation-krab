@@ -24,7 +24,8 @@
         "open.needs_changes",
         "open.approved",
         "closed.approved",
-        "closed.rejected"
+        "closed.rejected",
+        "closed.handled"
       ]
     },
     "nullable_item_status": {
@@ -88,7 +89,7 @@
           "required": [
             "event_seq", "kind", "project_key", "session_id", "item_id", "actor",
             "creator", "recipient", "work_claim", "from_status", "to_status",
-            "current_status", "version", "created_at"
+            "current_status", "completion_policy", "version", "created_at"
           ],
           "properties": {
             "event_seq": {"type": "integer", "minimum": 1},
@@ -103,6 +104,7 @@
             "from_status": {"$ref": "#/$defs/nullable_item_status"},
             "to_status": {"$ref": "#/$defs/nullable_item_status"},
             "current_status": {"$ref": "#/$defs/item_status"},
+            "completion_policy": {"enum": ["workflow", "receipt"]},
             "version": {"type": "integer", "minimum": 1},
             "created_at": {"type": "string", "format": "date-time"}
           }
@@ -131,7 +133,7 @@
           "required": [
             "event_seq", "kind", "project_key", "session_id", "item_id", "actor",
             "creator", "recipient", "work_claim", "from_status", "to_status",
-            "current_status", "version", "created_at"
+            "current_status", "completion_policy", "version", "created_at"
           ],
           "properties": {
             "event_seq": {"type": "integer", "minimum": 1},
@@ -146,6 +148,7 @@
             "from_status": {"$ref": "#/$defs/nullable_item_status"},
             "to_status": {"$ref": "#/$defs/nullable_item_status"},
             "current_status": {"$ref": "#/$defs/item_status"},
+            "completion_policy": {"enum": ["workflow", "receipt"]},
             "version": {"type": "integer", "minimum": 1},
             "created_at": {"type": "string", "format": "date-time"}
           }
@@ -197,7 +200,7 @@
           "additionalProperties": false,
           "required": [
             "item_id", "project_key", "session_id", "creator", "recipient",
-            "work_claim", "status", "version", "created_at", "updated_at"
+            "work_claim", "status", "completion_policy", "version", "created_at", "updated_at"
           ],
           "properties": {
             "item_id": {"type": "string", "pattern": "^itm_[0-9a-f]{32}$"},
@@ -207,6 +210,7 @@
             "recipient": {"$ref": "#/$defs/user"},
             "work_claim": {"$ref": "#/$defs/work_claim_link"},
             "status": {"$ref": "#/$defs/item_status"},
+            "completion_policy": {"enum": ["workflow", "receipt"]},
             "version": {"type": "integer", "minimum": 1},
             "created_at": {"type": "string", "format": "date-time"},
             "updated_at": {"type": "string", "format": "date-time"},

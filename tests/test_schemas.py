@@ -18,6 +18,27 @@ from imitation_krab.service import Service
 
 
 class SchemaFileTests(unittest.TestCase):
+    def test_item_policy_is_published_on_every_item_surface(self) -> None:
+        root = Path(__file__).resolve().parents[1] / "schemas" / "v1"
+
+        def unique_keys(pairs):
+            result = {}
+            for key, value in pairs:
+                self.assertNotIn(key, result)
+                result[key] = value
+            return result
+
+        resources = json.loads(
+            (root / "resources.schema.json").read_text(), object_pairs_hook=unique_keys
+        )["$defs"]
+        self.assertIn("closed.handled", resources["item_status"]["enum"])
+        for name in ("item", "event", "activity_event"):
+            with self.subTest(resource=name):
+                metadata = resources[name]["properties"]["trusted_metadata"]
+                self.assertIn("completion_policy", metadata["required"])
+                self.assertEqual(metadata["properties"]["completion_policy"],
+                                 {"enum": ["workflow", "receipt"]})
+
     def test_schema_catalog_is_parseable_and_all_local_refs_exist(self) -> None:
         root = Path(__file__).resolve().parents[1] / "schemas" / "v1"
         expected = {

@@ -1,7 +1,7 @@
 # Krab JSON response schemas
 
 `v1/` describes the stable response envelopes returned by the `/v1` API in
-Krab 0.6.x. User-controlled prose is always under `untrusted_text`; identities,
+Krab 0.7. User-controlled prose is always under `untrusted_text`; identities,
 routing, versions, timestamps, and sequence numbers are under
 `trusted_metadata`. The `health --json` CLI liveness response is an exception:
 it contains top-level `status` and `server_version` fields, with the latter
@@ -31,6 +31,21 @@ taken from the validated response header (or `null` for legacy servers).
 The schemas describe responses, not permissions. A syntactically valid response
 does not authorize an operation, prove GitHub state, or make `untrusted_text`
 safe to interpret as instructions.
+
+Item, queue/inbox event, and activity event `trusted_metadata` require immutable
+`completion_policy`, an enum of `workflow` and `receipt`. Workflow is the default
+on creation and migration. Item status also includes `closed.handled`, exclusively
+for receipt items. Receipt items can only be pending or handled; only their
+recipient can handle them using the existing status endpoint with expected
+version and an idempotency key. Claim-review notifications are receipt items.
+Inbox acknowledgement remains independent of item completion.
+
+Item creation accepts `completion_policy` as an optional string enum (`workflow`
+or `receipt`); null and other values are rejected. The field cannot be updated.
+Handling requests have `status: "closed.handled"`, a positive integer
+`expected_version`, and an optional `note`, using the existing status route.
+The `queue_limit` error's `details` object contains exactly `limit` (100) and
+`open_items` (the route's open-item count); it contains no item or participant data.
 
 Source distributions retain this directory. Wheel installations place the
 catalog under `$prefix/share/imitation-krab/schemas`.

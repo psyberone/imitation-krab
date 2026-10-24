@@ -118,6 +118,73 @@ def item_payload() -> dict:
 
 
 class CLIBehaviorTests(unittest.TestCase):
+    def test_human_item_output_exposes_effective_completion_policy(self) -> None:
+        for policy, expected in (
+            ("receipt", "receipt"),
+            ("workflow", "workflow"),
+            (None, "workflow"),
+        ):
+            for kind in ("item", "review"):
+                with self.subTest(policy=policy, kind=kind):
+                    item = item_payload()
+                    item["history"] = []
+                    metadata = item["trusted_metadata"]
+                    if policy is not None:
+                        metadata["completion_policy"] = policy
+                    metadata["status"] = "open.pending"
+                    item["untrusted_text"]["body"] = "policy=untrusted"
+                    payload = item if kind == "item" else {
+                        "trusted_metadata": {"action": "approved", "review_round": 2},
+                        "claim": claim_payload(),
+                        "notification": item,
+                    }
+                    output = StringIO()
+                    with redirect_stdout(output):
+                        _emit(SimpleNamespace(json=False), payload, kind=kind)
+                    self.assertIn(
+                        f"[project-one/{SESSION_ID}] {ITEM_ID} "
+                        f"open.pending v2 policy={expected}",
+                        output.getvalue().splitlines(),
+                    )
+
+    def test_human_event_output_exposes_completion_policy(self) -> None:
+        for policy in ("receipt", "workflow"):
+            for kind in ("queue", "item"):
+                with self.subTest(policy=policy, kind=kind):
+                    event = event_payload(scoped=kind == "queue")
+                    event["trusted_metadata"]["completion_policy"] = policy
+                    event["untrusted_text"]["note"] = "policy=untrusted"
+                    if kind == "queue":
+                        payload = {"events": [event]}
+                    else:
+                        payload = item_payload()
+                        payload["history"] = [event]
+                    output = StringIO()
+                    with redirect_stdout(output):
+                        _emit(SimpleNamespace(json=False), payload, kind=kind)
+                    self.assertIn(
+                        f"  policy={policy}", output.getvalue().splitlines()
+                    )
+
+    def test_receipt_send_and_explicit_handle_requests(self) -> None:
+        client = RecordingClient()
+        args = parse_args([
+            "send", "--project", "project-one", "--session", SESSION_ID,
+            "--to", "bob", "--title", "Verdict", "--body", "Reviewed",
+            "--completion-policy", "receipt",
+        ])
+        with redirect_stdout(StringIO()):
+            _run_client(args, client)
+        self.assertEqual(client.calls[0][2]["payload"]["completion_policy"], "receipt")
+        args = parse_args([
+            "status", ITEM_ID, "handled", "--project", "project-one",
+            "--session", SESSION_ID, "--expected-version", "1",
+        ])
+        with redirect_stdout(StringIO()):
+            _run_client(args, client)
+        self.assertEqual(client.calls[-1][2]["payload"],
+                         {"status": "closed.handled", "expected_version": 1})
+
     def test_release_version_is_0_6_4(self) -> None:
         self.assertEqual(__version__, "0.6.4")
 

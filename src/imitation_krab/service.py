@@ -43,6 +43,7 @@ STATUSES = {
     "open.approved",
     "closed.approved",
     "closed.rejected",
+    "closed.handled",
 }
 
 RECIPIENT_TRANSITIONS = {
@@ -973,6 +974,7 @@ class Service:
                     title=title.text,
                     body=body.text,
                     flags=flags,
+                    completion_policy="receipt",
                 )
 
                 target_status = "active" if action == "changes_requested" else "done"
@@ -1372,8 +1374,15 @@ class Service:
         project_key = self._valid_project_key(project_key)
         session_id = self._valid_object_id(session_id, "ses")
         self._require_fields(
-            payload, required={"to", "title", "body"}, optional={"claim_id"}
+            payload, required={"to", "title", "body"},
+            optional={"claim_id", "completion_policy"}
         )
+        completion_policy = payload.get("completion_policy", "workflow")
+        if completion_policy not in ("workflow", "receipt"):
+            raise ServiceError(
+                400, "invalid_completion_policy",
+                "completion_policy must be workflow or receipt",
+            )
         try:
             recipient_handle = validate_handle(payload["to"])
         except ValidationError as exc:
@@ -1396,6 +1405,8 @@ class Service:
             "claim_id": claim_id,
         }
         operation = f"item.create:{project_key}:{session_id}"
+        if completion_policy != "workflow":
+            canonical["completion_policy"] = completion_policy
         conn = self.db.connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -1412,6 +1423,7 @@ class Service:
                     title=title.text,
                     body=body.text,
                     flags=flags,
+                    completion_policy=completion_policy,
                 )
                 return 201, response
 
@@ -1515,6 +1527,11 @@ class Service:
                 else:
                     allowed = transition in CREATOR_TRANSITIONS
                     notify_user = item["recipient_id"]
+                if item["completion_policy"] == "receipt":
+                    allowed = (
+                        actor["id"] == item["recipient_id"]
+                        and transition == ("open.pending", "closed.handled")
+                    )
                 if not allowed:
                     raise ServiceError(
                         409,
@@ -1720,7 +1737,7 @@ class Service:
                 self._session_membership(conn, actor["id"], project["id"], session_id)
                 query = """
                     SELECT
-                        e.*, i.title, i.body, i.status AS current_status, i.version,
+                        e.*, i.title, i.body, i.status AS current_status, i.version, i.completion_policy,
                         i.work_claim_id,
                         wc.kind AS work_claim_kind,
                         wc.external_id AS work_claim_external_id,
@@ -1835,7 +1852,7 @@ class Service:
                 rows = conn.execute(
                     """
                     SELECT
-                        e.*, i.title, i.body, i.status AS current_status, i.version,
+                        e.*, i.title, i.body, i.status AS current_status, i.version, i.completion_policy,
                         i.work_claim_id,
                         wc.kind AS work_claim_kind,
                         wc.external_id AS work_claim_external_id,
@@ -1938,6 +1955,7 @@ class Service:
                         i.title,
                         i.status AS current_status,
                         i.version,
+                        i.completion_policy,
                         i.work_claim_id,
                         wc.kind AS work_claim_kind,
                         wc.external_id AS work_claim_external_id,
@@ -2201,6 +2219,7 @@ class Service:
         title: str,
         body: str,
         flags: tuple[str, ...],
+        completion_policy: str = "workflow",
     ) -> dict[str, Any]:
         self._session_membership(conn, actor_id, project_id, session_id)
         if claim_id is not None:
@@ -2252,7 +2271,8 @@ class Service:
         ).fetchone()["count"]
         if open_count >= MAX_OPEN_ITEMS_PER_ROUTE:
             raise ServiceError(
-                429, "queue_limit", "too many open items for this recipient"
+                429, "queue_limit", "too many open items for this recipient",
+                {"limit": MAX_OPEN_ITEMS_PER_ROUTE, "open_items": open_count},
             )
 
         item_id = self.db.new_id("itm")
@@ -2261,8 +2281,8 @@ class Service:
             """
             INSERT INTO items(
                 id, project_id, session_id, creator_id, recipient_id, work_claim_id,
-                title, body, risk_flags, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open.pending', ?, ?)
+                title, body, risk_flags, completion_policy, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open.pending', ?, ?)
             """,
             (
                 item_id,
@@ -2274,6 +2294,7 @@ class Service:
                 title,
                 body,
                 self._json_list(flags),
+                completion_policy,
                 now,
                 now,
             ),
@@ -2412,6 +2433,10 @@ class Service:
                 )
             response = json.loads(existing["response_json"])
             self._clear_legacy_content_flags(response)
+            for item_response in (response, response.get("notification", {})):
+                metadata = item_response.get("trusted_metadata", {})
+                if "item_id" in metadata and "status" in metadata:
+                    metadata.setdefault("completion_policy", "workflow")
             return MutationResult(existing["status_code"], response, replayed=True)
         status_code, response = mutate()
         response_json = json.dumps(
@@ -2500,6 +2525,7 @@ class Service:
                 },
                 "work_claim": Service._linked_work_metadata(row),
                 "status": row["status"],
+                "completion_policy": row["completion_policy"],
                 "version": row["version"],
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
@@ -2550,6 +2576,7 @@ class Service:
                 "from_status": row["from_status"],
                 "to_status": row["to_status"],
                 "current_status": row["current_status"],
+                "completion_policy": row["completion_policy"],
                 "version": row["version"],
                 "created_at": row["created_at"],
             },
@@ -2584,6 +2611,7 @@ class Service:
                 "from_status": row["from_status"],
                 "to_status": row["to_status"],
                 "current_status": row["current_status"],
+                "completion_policy": row["completion_policy"],
                 "version": row["version"],
                 "created_at": row["created_at"],
             },

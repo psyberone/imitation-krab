@@ -114,6 +114,7 @@ class V050ServiceTests(unittest.TestCase):
         )
         self.assertEqual(returned.payload["trusted_metadata"]["review_round"], 1)
         notification = returned.payload["notification"]
+        self.assertEqual(notification["trusted_metadata"]["completion_policy"], "receipt")
         self.assertEqual(notification["trusted_metadata"]["recipient"]["handle"], "bob")
         self.assertEqual(
             notification["trusted_metadata"]["work_claim"]["claim_id"], claim_id
@@ -121,6 +122,18 @@ class V050ServiceTests(unittest.TestCase):
         self.assertIn("review round 1", notification["untrusted_text"]["title"])
         self.assertEqual(notification["content_risk_flags"], [])
         self.assertEqual(notification["untrusted_text"]["body"], payload["body"])
+        claim_before_handle = self.service.get_work_claim(
+            self.alice, "project-one", "issue", claim_id
+        )
+        self.service.change_status(
+            self.bob, "project-one", self.session_one,
+            notification["trusted_metadata"]["item_id"],
+            {"status": "closed.handled", "expected_version": 1},
+            "v050-handle-verdict-0001",
+        )
+        self.assertEqual(claim_before_handle, self.service.get_work_claim(
+            self.alice, "project-one", "issue", claim_id
+        ))
 
         inbox = self.service.get_project_inbox(self.bob, "project-one")
         self.assertEqual(len(inbox["events"]), 1)
@@ -154,6 +167,7 @@ class V050ServiceTests(unittest.TestCase):
             approved.payload["claim"]["trusted_metadata"]["status"], "done"
         )
         self.assertEqual(approved.payload["trusted_metadata"]["review_round"], 2)
+        self.assertEqual(approved.payload["notification"]["trusted_metadata"]["completion_policy"], "receipt")
 
         detail = self.service.get_work_claim(self.bob, "project-one", "issue", claim_id)
         self.assertEqual(

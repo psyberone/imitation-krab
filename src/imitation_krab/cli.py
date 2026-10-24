@@ -41,6 +41,7 @@ STATUS_ALIASES = {
     "approved": "open.approved",
     "closed-approved": "closed.approved",
     "closed-rejected": "closed.rejected",
+    "handled": "closed.handled",
 }
 
 CLAIM_KIND_PATHS = {"issue": "issues", "pr": "pull-requests"}
@@ -392,6 +393,7 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--to", required=True)
     send.add_argument("--title", required=True)
     send.add_argument("--claim", help="immutably link an issue or pull-request claim")
+    send.add_argument("--completion-policy", choices=("workflow", "receipt"), default="workflow")
     _add_text_source(send, "body", required=True)
 
     queue = sub.add_parser("queue", help="read the authenticated user's private queue")
@@ -747,6 +749,8 @@ def _run_client(args: argparse.Namespace, client: APIClient) -> int:
         }
         if args.claim is not None:
             send_payload["claim_id"] = args.claim
+        if args.completion_policy != "workflow":
+            send_payload["completion_policy"] = args.completion_policy
         result = client.request(
             "POST",
             _scope_path(args) + "/items",
@@ -1145,7 +1149,7 @@ def _print_item(payload: dict[str, Any]) -> None:
     meta = payload["trusted_metadata"]
     print(
         f"[{meta['project_key']}/{meta['session_id']}] {meta['item_id']} "
-        f"{meta['status']} v{meta['version']}"
+        f"{meta['status']} v{meta['version']} policy={meta.get('completion_policy', 'workflow')}"
     )
     print(f"  {meta['creator']['handle']} -> {meta['recipient']['handle']}")
     if meta.get("work_claim") is not None:
@@ -1178,6 +1182,8 @@ def _print_event(event: dict[str, Any]) -> None:
     if meta.get("to_status"):
         transition = f" {meta.get('from_status') or '-'} -> {meta['to_status']}"
     print(f"{scope}event#{meta['event_seq']} {meta['kind']} by {actor}{transition}")
+    if "completion_policy" in meta:
+        print(f"  policy={meta['completion_policy']}")
     if meta.get("work_claim") is not None:
         work = meta["work_claim"]
         print(f"  linked {work['kind']} {work['external_id']} ({work['claim_id']})")
