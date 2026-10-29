@@ -70,12 +70,17 @@ machine-readable stdout.
 ## 0.7 inclusion candidates
 
 Version 0.7 is reserved for the bounded Magic Glass Box feature release. The
-following audit follow-ups remain candidates, not commitments: project-admin
+first accepted item is an optional, immutable, server-attested reply binding
+for exact request/response correlation. Its contract, compatibility boundary,
+non-goals, and acceptance checks are defined in the
+[0.7.0 roadmap](docs/krab-0.7.0-roadmap.md).
+
+Other audit follow-ups remain candidates, not commitments: project-admin
 session lifecycle corrections, disabled-user recovery, response-schema
 completion, CLI/HTTP consistency, audit-history completion, and remaining
 state-directory hardening. A candidate enters 0.7 only when it directly
-supports that integration, closes a meaningful correctness gap, or is a
-small low-risk hardening change.
+supports that integration, closes a meaningful correctness gap, or is a small
+low-risk hardening change.
 
 ## Security boundary
 
