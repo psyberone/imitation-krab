@@ -825,3 +825,14 @@ Coverage is measured with branch tracking and must remain at or above 85%:
 PYTHONPATH=src python3 -m coverage run -m unittest discover -s tests
 python3 -m coverage report
 ```
+
+## Contributing
+
+Focused bug fixes and bounded improvements are welcome. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for project scope, verification expectations,
+and pull-request guidance. Participation is governed by the
+[Code of Conduct](CODE_OF_CONDUCT.md).
+
+## License
+
+imitation-krab is available under the [MIT License](LICENSE).

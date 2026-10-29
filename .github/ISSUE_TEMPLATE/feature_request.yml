@@ -1,0 +1,65 @@
+name: Bounded improvement
+description: Propose a small change that fits Krab's local coordination boundary.
+title: "[Proposal] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Krab intentionally remains a small local mailbox and claim registry.
+        Describe the coordination gap first, then the smallest useful change.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Coordination problem
+      description: What concrete failure, delay, ambiguity, or repeated manual step are users experiencing?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Smallest useful change
+      description: Describe the narrow API, CLI, or storage behavior that would address the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: ownership
+    attributes:
+      label: Why this belongs in Krab
+      description: Explain why an agent, external orchestrator, platform integration, or operating-system convention cannot own this behavior more cleanly.
+    validations:
+      required: true
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Explicit non-goals
+      description: State what this proposal deliberately does not add or automate.
+    validations:
+      required: true
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Security, privacy, and compatibility impact
+      description: Identify visibility, authorization, schema, migration, idempotency, or deployment consequences. Write "None identified" when appropriate.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Include conventions or client-side approaches that were considered.
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I read the project scope and non-goals in the README.
+          required: true
+        - label: I searched the existing issues and roadmap material.
+          required: true
+        - label: This proposal does not add code execution, credential brokering, plugins, or automatic remote-platform integration.
+          required: true
+        - label: I agree to follow the project's Code of Conduct.
+          required: true

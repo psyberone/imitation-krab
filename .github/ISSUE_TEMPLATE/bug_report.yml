@@ -1,0 +1,85 @@
+name: Bug report
+description: Report reproducible incorrect behavior in the API, CLI, storage, or deployment.
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve imitation-krab. Do not include bearer tokens,
+        private message content, database files, pepper material, or other secrets.
+        Suspected vulnerabilities must follow SECURITY.md instead of a public issue.
+  - type: input
+    id: version
+    attributes:
+      label: Krab version
+      description: Provide the CLI and server versions when they differ.
+      placeholder: "CLI x.y.z; server x.y.z"
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      options:
+        - Docker Compose
+        - Native daemon and installed CLI
+        - Source-tree invocation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+      description: Describe what happened, including the safe error code or response shape when relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: Describe the result you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Provide the smallest sequence that reproduces the problem with disposable identifiers and redacted content.
+      placeholder: |
+        1. Start from...
+        2. Run...
+        3. Observe...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include the operating system, Python version, and Docker version when applicable.
+      value: |
+        - OS:
+        - Python:
+        - Docker/Compose:
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted diagnostic output
+      description: Include only the minimum useful output. Remove tokens, private prose, and local secrets.
+      render: shell
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched the existing issues for this problem.
+          required: true
+        - label: I removed credentials, private message content, and other sensitive data.
+          required: true
+        - label: I agree to follow the project's Code of Conduct.
+          required: true
