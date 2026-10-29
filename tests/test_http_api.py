@@ -4,6 +4,7 @@ import http.client
 import json
 import signal
 import socket
+import sqlite3
 import tempfile
 import threading
 import time
@@ -301,6 +302,104 @@ class HTTPAPITests(unittest.TestCase):
         self.assertEqual(raw_response.count(b"HTTP/1.1 "), 1, raw_response)
         self.assertIn(b" 400 ", raw_response.split(b"\r\n", 1)[0])
         self.assertIn(b"Connection: close\r\n", raw_response)
+        self.assertNotIn(b'{"status":"ok"}', raw_response)
+
+    def test_stalled_request_body_returns_timeout_and_closes_connection(self) -> None:
+        request = (
+            b"POST /v1/projects/project-one/sessions HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            + f"Authorization: Bearer {self.alice_token}\r\n".encode("ascii")
+            + b"Content-Type: application/json\r\n"
+            + b"Idempotency-Key: stalled-body-0001\r\n"
+            + b"Content-Length: 100\r\n\r\n{}"
+        )
+        server_socket, client_socket = socket.socketpair()
+        client_socket.settimeout(3)
+
+        def handle_request() -> None:
+            try:
+                KrabRequestHandler(server_socket, ("local", 0), self.server)
+            finally:
+                server_socket.close()
+
+        with mock.patch.object(
+            KrabRequestHandler, "header_timeout_seconds", 0.1
+        ):
+            thread = threading.Thread(target=handle_request, daemon=True)
+            thread.start()
+            try:
+                client_socket.sendall(request)
+                chunks: list[bytes] = []
+                while True:
+                    chunk = client_socket.recv(65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+            finally:
+                client_socket.close()
+                server_socket.close()
+                thread.join(timeout=2)
+
+        raw_response = b"".join(chunks)
+        head, body = raw_response.split(b"\r\n\r\n", 1)
+        self.assertIn(b" 408 ", head.split(b"\r\n", 1)[0])
+        self.assertIn(b"Connection: close\r\n", head + b"\r\n")
+        self.assertEqual(json.loads(body)["error"]["code"], "request_timeout")
+        self.assertEqual(raw_response.count(b"HTTP/1.1 "), 1)
+
+    def test_database_failure_before_body_read_closes_queued_request(self) -> None:
+        body = b'{"label":"Review","participants":["alice"]}'
+        queued = (
+            b"GET /v1/health HTTP/1.1\r\n"
+            b"Host: localhost\r\n\r\n"
+        )
+        request = (
+            b"POST /v1/projects/project-one/sessions HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            + f"Authorization: Bearer {self.alice_token}\r\n".encode("ascii")
+            + b"Content-Type: application/json\r\n"
+            + b"Idempotency-Key: database-error-0001\r\n"
+            + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+            + body
+            + queued
+        )
+        server_socket, client_socket = socket.socketpair()
+        client_socket.settimeout(3)
+
+        def handle_request() -> None:
+            try:
+                KrabRequestHandler(server_socket, ("local", 0), self.server)
+            finally:
+                server_socket.close()
+
+        with mock.patch.object(
+            self.server.database,
+            "authenticate",
+            side_effect=sqlite3.OperationalError("simulated database failure"),
+        ):
+            thread = threading.Thread(target=handle_request, daemon=True)
+            thread.start()
+            try:
+                client_socket.sendall(request)
+                chunks: list[bytes] = []
+                while True:
+                    chunk = client_socket.recv(65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+            finally:
+                client_socket.close()
+                server_socket.close()
+                thread.join(timeout=2)
+
+        raw_response = b"".join(chunks)
+        head, response_body = raw_response.split(b"\r\n\r\n", 1)
+        self.assertIn(b" 503 ", head.split(b"\r\n", 1)[0])
+        self.assertIn(b"Connection: close\r\n", head + b"\r\n")
+        self.assertEqual(
+            json.loads(response_body)["error"]["code"], "service_unavailable"
+        )
+        self.assertEqual(raw_response.count(b"HTTP/1.1 "), 1)
         self.assertNotIn(b'{"status":"ok"}', raw_response)
 
     def test_idle_connections_release_request_slots_after_header_deadline(self) -> None:

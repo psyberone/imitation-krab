@@ -33,6 +33,10 @@ class JsonRequestError(ValueError):
     pass
 
 
+class RequestTimeoutError(TimeoutError):
+    pass
+
+
 def decode_json_object(raw: bytes) -> dict[str, Any]:
     if not raw or len(raw) > MAX_REQUEST_BYTES:
         raise JsonRequestError(
@@ -223,6 +227,7 @@ class KrabRequestHandler(BaseHTTPRequestHandler):
         self._dispatch("PATCH")
 
     def do_OPTIONS(self) -> None:
+        self.close_connection = True
         self._json_response(
             405, self._error("method_not_allowed", "method not allowed")
         )
@@ -299,10 +304,19 @@ class KrabRequestHandler(BaseHTTPRequestHandler):
                 self._error("invalid_json", str(exc)),
                 request_id=request_id,
             )
+        except RequestTimeoutError as exc:
+            status = 408
+            self.close_connection = True
+            self._json_response(
+                status,
+                self._error("request_timeout", str(exc)),
+                request_id=request_id,
+            )
         except (BrokenPipeError, ConnectionResetError):
             status = 499
         except sqlite3.Error:
             status = 503
+            self.close_connection = True
             LOG.exception("database failure request_id=%s", request_id)
             self._json_response(
                 status,
@@ -311,6 +325,7 @@ class KrabRequestHandler(BaseHTTPRequestHandler):
             )
         except Exception:
             status = 500
+            self.close_connection = True
             LOG.exception("unhandled request failure request_id=%s", request_id)
             self._json_response(
                 status,
@@ -702,7 +717,14 @@ class KrabRequestHandler(BaseHTTPRequestHandler):
             raise JsonRequestError(
                 f"request body must contain 1 to {MAX_REQUEST_BYTES} bytes"
             )
-        raw = self.rfile.read(length)
+        try:
+            raw = self.rfile.read(length)
+        except TimeoutError as exc:
+            raise RequestTimeoutError("request body read timed out") from exc
+        except OSError as exc:
+            if "timed out" not in str(exc).lower():
+                raise
+            raise RequestTimeoutError("request body read timed out") from exc
         if len(raw) != length:
             raise JsonRequestError("incomplete request body")
         return decode_json_object(raw)

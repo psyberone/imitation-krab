@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import MAX_DATABASE_BYTES, default_db_path, default_pepper_path
+from .io_utils import write_all
 from .sanitize import sanitize_text, validate_handle, validate_project_key
 
 TOKEN_RE = re.compile(r"^krab_(usr_[0-9a-f]{32})_([A-Za-z0-9_-]{43})$")
@@ -470,8 +471,17 @@ class Database:
                     raise DatabaseError("database is not an imitation-krab database")
                 conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA)
                 conn.execute(
-                    "INSERT INTO schema_meta(version) VALUES (?)", (SCHEMA_VERSION,)
+                    """
+                    INSERT INTO schema_meta(version)
+                    SELECT ? WHERE NOT EXISTS (SELECT 1 FROM schema_meta)
+                    """,
+                    (SCHEMA_VERSION,),
                 )
+                metadata = conn.execute(
+                    "SELECT version FROM schema_meta"
+                ).fetchall()
+                if len(metadata) != 1 or metadata[0]["version"] != SCHEMA_VERSION:
+                    raise DatabaseError("database schema metadata is invalid")
                 conn.commit()
             else:
                 self._migrate_schema(conn)
@@ -727,6 +737,8 @@ class Database:
             check = target.execute("PRAGMA quick_check").fetchone()[0]
             if check != "ok":
                 raise DatabaseError("backup integrity check failed")
+            if target.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise DatabaseError("backup violates foreign-key integrity")
             target.close()
             target = None
             source.close()
@@ -838,6 +850,61 @@ class Database:
                 "user.token_rotated",
                 row["id"],
                 {"token_version": row["token_version"] + 1},
+            )
+            if token_delivery is not None:
+                token_delivery(token)
+            conn.commit()
+            return {"id": row["id"], "handle": handle, "active": True}, token
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def recover_user_token(
+        self,
+        handle: str,
+        *,
+        token_delivery: Callable[[str], None] | None = None,
+    ) -> tuple[dict[str, Any], str]:
+        """Rotate and reactivate a disabled identity in one transaction."""
+        handle = validate_handle(handle)
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT id, active, token_version FROM users WHERE handle = ?",
+                (handle,),
+            ).fetchone()
+            if row is None:
+                raise DatabaseError("user not found")
+            if row["active"]:
+                raise DatabaseError("user is active; use user-rotate instead")
+            token = self._new_token(row["id"])
+            now = self.now()
+            next_version = row["token_version"] + 1
+            updated = conn.execute(
+                """
+                UPDATE users
+                SET token_digest = ?, token_version = ?, active = 1, updated_at = ?
+                WHERE id = ? AND active = 0 AND token_version = ?
+                """,
+                (
+                    self._token_digest(token),
+                    next_version,
+                    now,
+                    row["id"],
+                    row["token_version"],
+                ),
+            )
+            if updated.rowcount != 1:
+                raise DatabaseError("user recovery conflicted with another update")
+            self._audit(
+                conn,
+                None,
+                "user.recovered",
+                row["id"],
+                {"token_version": next_version},
             )
             if token_delivery is not None:
                 token_delivery(token)
@@ -1118,9 +1185,14 @@ class Database:
                 flags |= os.O_NOFOLLOW
             fd = os.open(self.pepper_path, flags, 0o600)
             try:
-                os.write(fd, secrets.token_bytes(32))
+                write_all(fd, secrets.token_bytes(32))
                 os.fsync(fd)
-            finally:
+            except BaseException:
+                os.close(fd)
+                with suppress(OSError):
+                    self.pepper_path.unlink()
+                raise
+            else:
                 os.close(fd)
         else:
             info = self.pepper_path.lstat()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import tempfile
 import threading
@@ -1332,6 +1333,75 @@ class ServiceTests(ServiceFixture):
             created["trusted_metadata"]["event_seq"],
         )
 
+    def test_stale_or_disabled_actor_cannot_start_or_replay_a_mutation(self) -> None:
+        created = self.service.create_session(
+            self.bob,
+            "project-one",
+            {"label": "Bob's session", "participants": ["bob"]},
+            "bob-session-before-rotation-0001",
+        )
+        self.assertEqual(created.status, 201)
+
+        _, replacement = self.db.rotate_user_token("bob")
+        with self.assertRaises(ServiceError) as caught:
+            self.service.create_session(
+                self.bob,
+                "project-one",
+                {"label": "Bob's session", "participants": ["bob"]},
+                "bob-session-before-rotation-0001",
+            )
+        self.assertEqual(
+            (caught.exception.status, caught.exception.code),
+            (401, "unauthorized"),
+        )
+
+        current_bob = self.db.authenticate(replacement)
+        assert current_bob
+        self.db.disable_user("bob")
+        with self.assertRaises(ServiceError) as caught:
+            self.service.create_session(
+                current_bob,
+                "project-one",
+                {"label": "Disabled", "participants": ["bob"]},
+                "bob-session-after-disable-0001",
+            )
+        self.assertEqual(
+            (caught.exception.status, caught.exception.code),
+            (401, "unauthorized"),
+        )
+
+    def test_disabled_user_recovery_rotates_and_reactivates_atomically(self) -> None:
+        self.db.disable_user("bob")
+
+        def fail_delivery(_token: str) -> None:
+            raise OSError("simulated recovery delivery failure")
+
+        with self.assertRaisesRegex(OSError, "simulated recovery"):
+            self.db.recover_user_token("bob", token_delivery=fail_delivery)
+        failed = {
+            row["trusted_metadata"]["handle"]: row["trusted_metadata"]
+            for row in self.db.list_users()["users"]
+        }["bob"]
+        self.assertFalse(failed["active"])
+        self.assertEqual(failed["token_version"], 1)
+        self.assertIsNone(self.db.authenticate(self.bob_token))
+
+        recovered, token = self.db.recover_user_token("bob")
+        self.assertTrue(recovered["active"])
+        self.assertIsNone(self.db.authenticate(self.bob_token))
+        actor = self.db.authenticate(token)
+        assert actor
+        self.assertEqual(actor["token_version"], 2)
+        created = self.service.create_session(
+            actor,
+            "project-one",
+            {"label": "Recovered", "participants": ["bob"]},
+            "bob-recovered-session-0001",
+        )
+        self.assertEqual(created.status, 201)
+        with self.assertRaisesRegex(DatabaseError, "use user-rotate"):
+            self.db.recover_user_token("bob")
+
     def test_disable_revokes_an_in_flight_long_poll(self) -> None:
         with ThreadPoolExecutor(max_workers=1) as pool:
             waiting = pool.submit(
@@ -1383,6 +1453,120 @@ class ServiceTests(ServiceFixture):
         ):
             self.db.backup(failed_path)
         self.assertFalse(failed_path.exists())
+
+    def test_backup_rejects_and_removes_foreign_key_corruption(self) -> None:
+        conn = self.db.connect()
+        try:
+            conn.execute("PRAGMA foreign_keys = OFF")
+            project_id = conn.execute(
+                "SELECT id FROM projects WHERE project_key = 'project-one'"
+            ).fetchone()["id"]
+            conn.execute(
+                """
+                INSERT INTO project_members(project_id, user_id, role, created_at)
+                VALUES (?, ?, 'member', ?)
+                """,
+                (project_id, "usr_" + "f" * 32, self.db.now()),
+            )
+        finally:
+            conn.close()
+
+        backup_path = Path(self.temporary.name) / "corrupt-backup.db"
+        with self.assertRaisesRegex(DatabaseError, "foreign-key integrity"):
+            self.db.backup(backup_path)
+        self.assertFalse(backup_path.exists())
+
+    def test_concurrent_first_initialization_keeps_one_metadata_row(self) -> None:
+        root = Path(self.temporary.name) / "concurrent-init"
+        root.mkdir(mode=0o700)
+        pepper_path = root / "pepper.key"
+        pepper_path.write_bytes(b"p" * 32)
+        pepper_path.chmod(0o600)
+        database_path = root / "krab.db"
+        with closing(sqlite3.connect(database_path)) as conn:
+            conn.execute("PRAGMA journal_mode = WAL")
+        database_path.chmod(0o600)
+        barrier = threading.Barrier(2)
+
+        class CursorProxy:
+            def __init__(self, cursor: sqlite3.Cursor):
+                self.cursor = cursor
+
+            def fetchall(self):
+                rows = self.cursor.fetchall()
+                barrier.wait(timeout=3)
+                return rows
+
+            def __getattr__(self, name: str):
+                return getattr(self.cursor, name)
+
+        class ConnectionProxy:
+            def __init__(self, connection: sqlite3.Connection):
+                self.connection = connection
+
+            def execute(self, statement: str, parameters=()):
+                cursor = self.connection.execute(statement, parameters)
+                if "SELECT name FROM sqlite_master" in statement:
+                    return CursorProxy(cursor)
+                return cursor
+
+            def __getattr__(self, name: str):
+                return getattr(self.connection, name)
+
+        class RacingDatabase(Database):
+            def connect(self, *, initialize: bool = True):
+                connection = super().connect(initialize=initialize)
+                if initialize:
+                    return connection
+                return ConnectionProxy(connection)
+
+        databases = [
+            RacingDatabase(database_path, pepper_path),
+            RacingDatabase(database_path, pepper_path),
+        ]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = [pool.submit(database.initialize) for database in databases]
+            for result in results:
+                result.result(timeout=5)
+
+        with closing(sqlite3.connect(database_path)) as conn:
+            self.assertEqual(
+                conn.execute("SELECT version FROM schema_meta").fetchall(),
+                [(SCHEMA_VERSION,)],
+            )
+        Database(database_path, pepper_path).connect().close()
+
+    def test_pepper_creation_completes_repeated_short_writes(self) -> None:
+        root = Path(self.temporary.name) / "short-pepper"
+        database = Database(root / "krab.db", root / "pepper.key")
+        original_write = os.write
+        calls = 0
+
+        def short_write(fd: int, data: bytes | memoryview) -> int:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise InterruptedError
+            value = bytes(data)
+            return original_write(fd, value[:1])
+
+        with patch("imitation_krab.io_utils.os.write", side_effect=short_write):
+            database.initialize()
+
+        self.assertGreater(calls, 1)
+        self.assertEqual(len(database.pepper_path.read_bytes()), 32)
+
+    def test_pepper_creation_removes_incomplete_file_on_zero_write(self) -> None:
+        root = Path(self.temporary.name) / "zero-pepper"
+        database = Database(root / "krab.db", root / "pepper.key")
+
+        with patch(
+            "imitation_krab.io_utils.os.write", return_value=0
+        ), self.assertRaisesRegex(OSError, "made no progress"):
+            database.initialize()
+
+        self.assertFalse(database.pepper_path.exists())
+        self.assertFalse(database.path.exists())
 
     def test_backup_preserves_legacy_source_schema_without_migrating(self) -> None:
         backup_path = Path(self.temporary.name) / "legacy-backup.db"
@@ -1691,6 +1875,203 @@ class ServiceTests(ServiceFixture):
             "close-session-0002",
         )
         self.assertEqual(closed.payload["trusted_metadata"]["state"], "closed")
+
+    def test_project_admin_can_close_known_nonparticipant_session(self) -> None:
+        private_session = self.service.create_session(
+            self.bob,
+            "project-one",
+            {"label": "Bob only", "participants": ["bob"]},
+            "bob-private-session-0001",
+        ).payload["trusted_metadata"]["session_id"]
+        self.assertNotIn(
+            private_session,
+            {
+                row["trusted_metadata"]["session_id"]
+                for row in self.service.list_sessions(self.alice, "project-one")[
+                    "sessions"
+                ]
+            },
+        )
+
+        closed = self.service.close_session(
+            self.alice,
+            "project-one",
+            private_session,
+            {},
+            "admin-close-private-session-0001",
+        )
+        self.assertEqual(closed.payload["trusted_metadata"]["state"], "closed")
+
+        with self.assertRaises(ServiceError) as caught:
+            self.service.close_session(
+                self.mallory,
+                "project-two",
+                private_session,
+                {},
+                "cross-project-admin-close-0001",
+            )
+        self.assertEqual(
+            (caught.exception.status, caught.exception.code),
+            (404, "scope_not_found"),
+        )
+
+    def test_item_and_claim_detail_reads_use_one_snapshot(self) -> None:
+        item_id = self.create_item(key="snapshot-item-create-0001").payload[
+            "trusted_metadata"
+        ]["item_id"]
+        original_item_row = self.service._item_row
+        item_triggered = False
+
+        def interleaved_item_row(*args, **kwargs):
+            nonlocal item_triggered
+            row = original_item_row(*args, **kwargs)
+            if not item_triggered:
+                item_triggered = True
+                self.service.change_status(
+                    self.bob,
+                    "project-one",
+                    self.session_id,
+                    item_id,
+                    {"status": "open.in_progress", "expected_version": 1},
+                    "snapshot-item-progress-0001",
+                )
+            return row
+
+        with patch.object(
+            self.service, "_item_row", side_effect=interleaved_item_row
+        ):
+            item = self.service.get_item(
+                self.alice, "project-one", self.session_id, item_id
+            )
+        self.assertEqual(item["trusted_metadata"]["status"], "open.pending")
+        self.assertEqual(
+            [event["trusted_metadata"]["kind"] for event in item["history"]],
+            ["item.created"],
+        )
+        current_item = self.service.get_item(
+            self.alice, "project-one", self.session_id, item_id
+        )
+        self.assertEqual(current_item["trusted_metadata"]["status"], "open.in_progress")
+
+        claim_id = self.create_claim(
+            external_id="owner/repository#snapshot",
+            key="snapshot-claim-create-0001",
+        ).payload["trusted_metadata"]["claim_id"]
+        self.service.claim_work(
+            self.bob,
+            "project-one",
+            "issue",
+            claim_id,
+            {"expected_version": 1},
+            "snapshot-claim-take-0001",
+        )
+        self.service.change_work_status(
+            self.bob,
+            "project-one",
+            "issue",
+            claim_id,
+            {"status": "active", "expected_version": 2},
+            "snapshot-claim-active-0001",
+        )
+        original_claim_row = self.service._work_claim_row
+        claim_triggered = False
+
+        def interleaved_claim_row(*args, **kwargs):
+            nonlocal claim_triggered
+            row = original_claim_row(*args, **kwargs)
+            if not claim_triggered:
+                claim_triggered = True
+                self.service.change_work_status(
+                    self.bob,
+                    "project-one",
+                    "issue",
+                    claim_id,
+                    {"status": "under_review", "expected_version": 3},
+                    "snapshot-claim-review-0001",
+                )
+            return row
+
+        with patch.object(
+            self.service, "_work_claim_row", side_effect=interleaved_claim_row
+        ):
+            claim = self.service.get_work_claim(
+                self.alice, "project-one", "issue", claim_id
+            )
+        self.assertEqual(claim["claim"]["trusted_metadata"]["status"], "active")
+        self.assertEqual(claim["review_history"], [])
+        current_claim = self.service.get_work_claim(
+            self.alice, "project-one", "issue", claim_id
+        )
+        self.assertEqual(
+            current_claim["claim"]["trusted_metadata"]["status"], "under_review"
+        )
+        self.assertEqual(
+            current_claim["review_history"][0]["trusted_metadata"]["action"],
+            "submitted",
+        )
+
+    def test_project_inbox_cursor_and_deliveries_use_one_snapshot(self) -> None:
+        first = self.create_item(key="snapshot-inbox-first-0001").payload[
+            "trusted_metadata"
+        ]["event_seq"]
+        original_connect = self.db.connect
+        trigger_pending = True
+
+        class OneRowCursor:
+            def __init__(self, row):
+                self.row = row
+
+            def fetchone(self):
+                return self.row
+
+        class ConnectionProxy:
+            def __init__(self, connection: sqlite3.Connection):
+                self.connection = connection
+
+            def execute(self, statement: str, parameters=()):
+                nonlocal trigger_pending
+                cursor = self.connection.execute(statement, parameters)
+                if trigger_pending and "SELECT acked_through" in statement:
+                    trigger_pending = False
+                    row = cursor.fetchone()
+                    self.create_concurrent_item()
+                    return OneRowCursor(row)
+                return cursor
+
+            def create_concurrent_item(self) -> None:
+                self_outer.create_item(key="snapshot-inbox-second-0001")
+
+            def __getattr__(self, name: str):
+                return getattr(self.connection, name)
+
+        self_outer = self
+        first_connection = True
+
+        def connect(*, initialize: bool = True):
+            nonlocal first_connection
+            connection = original_connect(initialize=initialize)
+            if first_connection:
+                first_connection = False
+                return ConnectionProxy(connection)
+            return connection
+
+        with patch.object(self.db, "connect", side_effect=connect):
+            inbox = self.service.get_project_inbox(
+                self.bob, "project-one", after=0
+            )
+
+        self.assertEqual(inbox["trusted_metadata"]["next_cursor"], first)
+        self.assertEqual(
+            [event["trusted_metadata"]["event_seq"] for event in inbox["events"]],
+            [first],
+        )
+        current = self.service.get_project_inbox(
+            self.bob, "project-one", after=first
+        )
+        self.assertEqual(len(current["events"]), 1)
+        self.assertGreater(
+            current["events"][0]["trusted_metadata"]["event_seq"], first
+        )
 
     def test_reminders_have_no_message_body_and_are_throttled(self) -> None:
         item_id = self.create_item().payload["trusted_metadata"]["item_id"]
