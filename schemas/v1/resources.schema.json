@@ -89,7 +89,8 @@
           "required": [
             "event_seq", "kind", "project_key", "session_id", "item_id", "actor",
             "creator", "recipient", "work_claim", "from_status", "to_status",
-            "current_status", "completion_policy", "version", "created_at"
+            "current_status", "completion_policy", "in_reply_to_item_id", "version",
+            "created_at"
           ],
           "properties": {
             "event_seq": {"type": "integer", "minimum": 1},
@@ -105,6 +106,12 @@
             "to_status": {"$ref": "#/$defs/nullable_item_status"},
             "current_status": {"$ref": "#/$defs/item_status"},
             "completion_policy": {"enum": ["workflow", "receipt"]},
+            "in_reply_to_item_id": {
+              "oneOf": [
+                {"type": "null"},
+                {"type": "string", "pattern": "^itm_[0-9a-f]{32}$"}
+              ]
+            },
             "version": {"type": "integer", "minimum": 1},
             "created_at": {"type": "string", "format": "date-time"}
           }
@@ -200,7 +207,8 @@
           "additionalProperties": false,
           "required": [
             "item_id", "project_key", "session_id", "creator", "recipient",
-            "work_claim", "status", "completion_policy", "version", "created_at", "updated_at"
+            "work_claim", "in_reply_to_item_id", "status", "completion_policy",
+            "version", "created_at", "updated_at"
           ],
           "properties": {
             "item_id": {"type": "string", "pattern": "^itm_[0-9a-f]{32}$"},
@@ -209,6 +217,12 @@
             "creator": {"$ref": "#/$defs/user"},
             "recipient": {"$ref": "#/$defs/user"},
             "work_claim": {"$ref": "#/$defs/work_claim_link"},
+            "in_reply_to_item_id": {
+              "oneOf": [
+                {"type": "null"},
+                {"type": "string", "pattern": "^itm_[0-9a-f]{32}$"}
+              ]
+            },
             "status": {"$ref": "#/$defs/item_status"},
             "completion_policy": {"enum": ["workflow", "receipt"]},
             "version": {"type": "integer", "minimum": 1},

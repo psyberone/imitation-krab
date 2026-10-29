@@ -39,6 +39,26 @@ class SchemaFileTests(unittest.TestCase):
                 self.assertEqual(metadata["properties"]["completion_policy"],
                                  {"enum": ["workflow", "receipt"]})
 
+    def test_reply_binding_is_published_only_on_private_item_surfaces(self) -> None:
+        root = Path(__file__).resolve().parents[1] / "schemas" / "v1"
+        resources = json.loads((root / "resources.schema.json").read_text())["$defs"]
+        expected = {
+            "oneOf": [
+                {"type": "null"},
+                {"type": "string", "pattern": "^itm_[0-9a-f]{32}$"},
+            ]
+        }
+        for name in ("item", "event"):
+            with self.subTest(resource=name):
+                metadata = resources[name]["properties"]["trusted_metadata"]
+                self.assertIn("in_reply_to_item_id", metadata["required"])
+                self.assertEqual(
+                    metadata["properties"]["in_reply_to_item_id"], expected
+                )
+        activity = resources["activity_event"]["properties"]["trusted_metadata"]
+        self.assertNotIn("in_reply_to_item_id", activity["required"])
+        self.assertNotIn("in_reply_to_item_id", activity["properties"])
+
     def test_schema_catalog_is_parseable_and_all_local_refs_exist(self) -> None:
         root = Path(__file__).resolve().parents[1] / "schemas" / "v1"
         expected = {

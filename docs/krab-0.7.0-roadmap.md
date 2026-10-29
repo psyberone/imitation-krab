@@ -1,6 +1,7 @@
 # Krab 0.7.0 MGB integration roadmap
 
-- **Status:** one accepted bounded feature; implementation not started
+- **Status:** reply binding implemented and verified on the `0.7.0` branch;
+  release not yet deployed
 - **Baseline:** current `main` after receipt-policy delivery / schema 7
 - **Release purpose:** provide the smallest server-attested transport relation
   needed for Magic Glass Box interactions without importing orchestration

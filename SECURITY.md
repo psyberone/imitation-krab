@@ -54,6 +54,9 @@ the raw bearer token in model context.
 17. A newest-page queue read uses the same authenticated delivery and session
     scope as an ordinary queue read. It changes ordering and pagination only;
     it never broadens content visibility or advances acknowledgement state.
+18. An item reply link is optional and immutable. Its target must pre-exist in
+    the same project and session on the exact reverse creator/recipient route.
+    Only item participants can observe the link; project activity omits it.
 
 ## Trust boundaries
 
@@ -80,6 +83,11 @@ and current token version. It never returns bearer material or a stored digest.
 Consumers must key identity relationships by `user_id`, not by the rotatable
 bearer token. A Krab bearer token authenticates only to Krab and must not be
 accepted as a user login credential by an external orchestrator.
+
+`in_reply_to_item_id` attests only that one authenticated participant created a
+new item on the reverse route and named an earlier item as its target. It does
+not attest semantic responsiveness, correctness, approval, receipt, claim
+state, or orchestration state.
 
 ### Untrusted content
 
@@ -134,6 +142,7 @@ content.
 | Cross-session inbox disclosure | Project membership plus authenticated-user delivery rows and session-membership joins; no project-wide broadcast rows |
 | Newest-page queue disclosure | Identical delivery/session authorization and event serializer as forward queue reads; fixed page cap; no long-poll combination |
 | Project activity overexposure | Active project-membership check, explicit SQL column selection, dedicated allowlist serializer, title-only untrusted text, no delivery body/note/history/risk fields |
+| Private reply-topology disclosure or forgery | Participant-only item/queue/inbox surfaces, activity omission, same-project/session reverse-route validation, self foreign key, and immutable-link trigger |
 | Lost or forged read position | Explicit per-user/project monotonic acknowledgement bounded by the highest event delivered to that same user |
 | Queue or connection flooding | One-second incomplete-header deadline, request throttles, per-user long-poll concurrency, participant/session/event limits, message-size limits, per-route open-item cap, and database-size cap |
 | Terminal/log injection | Dangerous controls rejected on ingress; console escapes again on output; structured logs omit bodies |
@@ -269,7 +278,8 @@ checks limit other users' data, not that user's own blast radius.
 Security-relevant changes should preserve tests for authentication isolation,
 scope isolation, fixed status transitions, optimistic concurrency,
 idempotency, strict JSON parsing, terminal-active Unicode/control characters,
-unchanged prose delivery, immutable content and work links, queue privacy,
+unchanged prose delivery, immutable content, claim links, and exact reply links,
+reverse-route scope enforcement, activity omission, queue privacy,
 atomic claim ownership, coordinator/admin creation and assignment boundaries, additive
 import behavior, independent review and self-approval denial, exact scoped
 claim filters, release boundaries, and reminder throttling.

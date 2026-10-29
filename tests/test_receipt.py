@@ -5,7 +5,7 @@ import sqlite3
 from unittest.mock import patch
 
 from test_service import ServiceFixture
-from imitation_krab.db import DatabaseError
+from imitation_krab.db import DatabaseError, SCHEMA_VERSION
 from imitation_krab.service import ServiceError
 
 
@@ -170,7 +170,10 @@ class ReceiptTests(ServiceFixture):
         with self.db.connect() as conn:
             self.assertEqual(conn.execute("PRAGMA foreign_keys").fetchone()[0], 1)
             self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
-            self.assertEqual(conn.execute("SELECT version FROM schema_meta").fetchone()[0], 7)
+            self.assertEqual(
+                conn.execute("SELECT version FROM schema_meta").fetchone()[0],
+                SCHEMA_VERSION,
+            )
             row = conn.execute("SELECT * FROM items WHERE id = ?", (item,)).fetchone()
             self.assertEqual(row["completion_policy"], "workflow")
             self.assertEqual(tuple(row[column["name"]] for column in conn.execute(

@@ -185,8 +185,36 @@ class CLIBehaviorTests(unittest.TestCase):
         self.assertEqual(client.calls[-1][2]["payload"],
                          {"status": "closed.handled", "expected_version": 1})
 
-    def test_release_version_is_0_6_4(self) -> None:
-        self.assertEqual(__version__, "0.6.4")
+    def test_send_carries_an_explicit_reply_binding_and_pretty_prints_it(self) -> None:
+        request_id = "itm_" + "a" * 32
+        client = RecordingClient()
+        args = parse_args([
+            "send", "--project", "project-one", "--session", SESSION_ID,
+            "--to", "bob", "--title", "Answer", "--body", "Response",
+            "--in-reply-to", request_id,
+        ])
+        with redirect_stdout(StringIO()):
+            _run_client(args, client)
+        self.assertEqual(
+            client.calls[0][2]["payload"]["in_reply_to_item_id"], request_id
+        )
+
+        item = item_payload()
+        item["trusted_metadata"]["in_reply_to_item_id"] = request_id
+        output = StringIO()
+        with redirect_stdout(output):
+            _emit(SimpleNamespace(json=False), item, kind="item")
+        self.assertIn(f"  in-reply-to {request_id}", output.getvalue().splitlines())
+
+        event = event_payload()
+        event["trusted_metadata"]["in_reply_to_item_id"] = request_id
+        output = StringIO()
+        with redirect_stdout(output):
+            _emit(SimpleNamespace(json=False), {"events": [event]}, kind="queue")
+        self.assertIn(f"  in-reply-to {request_id}", output.getvalue().splitlines())
+
+    def test_release_version_is_0_7_0(self) -> None:
+        self.assertEqual(__version__, "0.7.0")
 
     def test_api_client_serializes_requests_and_rejects_bad_responses(self) -> None:
         client = APIClient(
@@ -483,6 +511,8 @@ class CLIBehaviorTests(unittest.TestCase):
                         "Please review",
                         "--claim",
                         CLAIM_ID,
+                        "--in-reply-to",
+                        "itm_" + "a" * 32,
                     ],
                     (
                         "POST",
@@ -493,6 +523,7 @@ class CLIBehaviorTests(unittest.TestCase):
                                 "title": "Review",
                                 "body": "Please review",
                                 "claim_id": CLAIM_ID,
+                                "in_reply_to_item_id": "itm_" + "a" * 32,
                             }
                         },
                     ),

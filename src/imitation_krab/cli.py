@@ -393,6 +393,11 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--to", required=True)
     send.add_argument("--title", required=True)
     send.add_argument("--claim", help="immutably link an issue or pull-request claim")
+    send.add_argument(
+        "--in-reply-to",
+        metavar="ITEM_ID",
+        help="immutably bind this item to an earlier reverse-route item",
+    )
     send.add_argument("--completion-policy", choices=("workflow", "receipt"), default="workflow")
     _add_text_source(send, "body", required=True)
 
@@ -749,6 +754,8 @@ def _run_client(args: argparse.Namespace, client: APIClient) -> int:
         }
         if args.claim is not None:
             send_payload["claim_id"] = args.claim
+        if args.in_reply_to is not None:
+            send_payload["in_reply_to_item_id"] = args.in_reply_to
         if args.completion_policy != "workflow":
             send_payload["completion_policy"] = args.completion_policy
         result = client.request(
@@ -1155,6 +1162,8 @@ def _print_item(payload: dict[str, Any]) -> None:
     if meta.get("work_claim") is not None:
         work = meta["work_claim"]
         print(f"  linked {work['kind']} {work['external_id']} ({work['claim_id']})")
+    if meta.get("in_reply_to_item_id") is not None:
+        print(f"  in-reply-to {meta['in_reply_to_item_id']}")
     text = payload.get("untrusted_text", {})
     _print_untrusted(text.get("title", ""), field="title")
     _print_untrusted(text.get("body", ""), field="body")
@@ -1187,6 +1196,8 @@ def _print_event(event: dict[str, Any]) -> None:
     if meta.get("work_claim") is not None:
         work = meta["work_claim"]
         print(f"  linked {work['kind']} {work['external_id']} ({work['claim_id']})")
+    if meta.get("in_reply_to_item_id") is not None:
+        print(f"  in-reply-to {meta['in_reply_to_item_id']}")
     for field in ("title", "body", "note"):
         value = event.get("untrusted_text", {}).get(field)
         if value:

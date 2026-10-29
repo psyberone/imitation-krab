@@ -568,6 +568,70 @@ class HTTPAPITests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(data["error"]["code"], "validation_error")
 
+    def test_http_reply_binding_is_private_and_exact(self) -> None:
+        session_id = self.create_session()
+        item_path = f"/v1/projects/project-one/sessions/{session_id}/items"
+        status, request, _ = self.request(
+            "POST",
+            item_path,
+            self.alice_token,
+            {"to": "bob", "title": "Question", "body": "Please answer."},
+            key="http-reply-request-0001",
+        )
+        self.assertEqual(status, 201, request)
+        request_id = request["trusted_metadata"]["item_id"]
+        self.assertIsNone(request["trusted_metadata"]["in_reply_to_item_id"])
+
+        status, reply, _ = self.request(
+            "POST",
+            item_path,
+            self.bob_token,
+            {
+                "to": "alice",
+                "title": "Answer",
+                "body": "Done.",
+                "in_reply_to_item_id": request_id,
+            },
+            key="http-reply-response-0001",
+        )
+        self.assertEqual(status, 201, reply)
+        self.assertEqual(
+            reply["trusted_metadata"]["in_reply_to_item_id"], request_id
+        )
+
+        status, queue, _ = self.request(
+            "GET",
+            f"/v1/projects/project-one/sessions/{session_id}/queue",
+            self.alice_token,
+        )
+        self.assertEqual(status, 200, queue)
+        self.assertEqual(
+            queue["events"][0]["trusted_metadata"]["in_reply_to_item_id"],
+            request_id,
+        )
+
+        status, activity, _ = self.request(
+            "GET", "/v1/projects/project-one/activity", self.primary_token
+        )
+        self.assertEqual(status, 200, activity)
+        for event in activity["events"]:
+            self.assertNotIn("in_reply_to_item_id", event["trusted_metadata"])
+
+        status, hidden, _ = self.request(
+            "POST",
+            item_path,
+            self.alice_token,
+            {
+                "to": "bob",
+                "title": "Wrong route",
+                "body": "Must fail.",
+                "in_reply_to_item_id": request_id,
+            },
+            key="http-reply-wrong-route-0001",
+        )
+        self.assertEqual(status, 404, hidden)
+        self.assertEqual(hidden["error"]["code"], "item_not_found")
+
     def test_http_private_queue_latest_is_bounded_and_cannot_long_poll(self) -> None:
         session_id = self.create_session()
         item_path = f"/v1/projects/project-one/sessions/{session_id}/items"

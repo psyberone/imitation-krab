@@ -1375,7 +1375,7 @@ class Service:
         session_id = self._valid_object_id(session_id, "ses")
         self._require_fields(
             payload, required={"to", "title", "body"},
-            optional={"claim_id", "completion_policy"}
+            optional={"claim_id", "completion_policy", "in_reply_to_item_id"}
         )
         completion_policy = payload.get("completion_policy", "workflow")
         if completion_policy not in ("workflow", "receipt"):
@@ -1390,6 +1390,11 @@ class Service:
         claim_id = None
         if "claim_id" in payload:
             claim_id = self._valid_object_id(payload["claim_id"], "clm")
+        in_reply_to_item_id = None
+        if "in_reply_to_item_id" in payload:
+            in_reply_to_item_id = self._valid_object_id(
+                payload["in_reply_to_item_id"], "itm"
+            )
         title = self._sanitized_text(
             payload["title"], field="title", max_bytes=MAX_TITLE_BYTES
         )
@@ -1405,6 +1410,8 @@ class Service:
             "claim_id": claim_id,
         }
         operation = f"item.create:{project_key}:{session_id}"
+        if in_reply_to_item_id is not None:
+            canonical["in_reply_to_item_id"] = in_reply_to_item_id
         if completion_policy != "workflow":
             canonical["completion_policy"] = completion_policy
         conn = self.db.connect()
@@ -1424,6 +1431,7 @@ class Service:
                     body=body.text,
                     flags=flags,
                     completion_policy=completion_policy,
+                    in_reply_to_item_id=in_reply_to_item_id,
                 )
                 return 201, response
 
@@ -1738,6 +1746,7 @@ class Service:
                 query = """
                     SELECT
                         e.*, i.title, i.body, i.status AS current_status, i.version, i.completion_policy,
+                        i.in_reply_to_item_id,
                         i.work_claim_id,
                         wc.kind AS work_claim_kind,
                         wc.external_id AS work_claim_external_id,
@@ -1853,6 +1862,7 @@ class Service:
                     """
                     SELECT
                         e.*, i.title, i.body, i.status AS current_status, i.version, i.completion_policy,
+                        i.in_reply_to_item_id,
                         i.work_claim_id,
                         wc.kind AS work_claim_kind,
                         wc.external_id AS work_claim_external_id,
@@ -2220,6 +2230,7 @@ class Service:
         body: str,
         flags: tuple[str, ...],
         completion_policy: str = "workflow",
+        in_reply_to_item_id: str | None = None,
     ) -> dict[str, Any]:
         self._session_membership(conn, actor_id, project_id, session_id)
         if claim_id is not None:
@@ -2261,6 +2272,27 @@ class Service:
             )
         if recipient["id"] == actor_id:
             raise ServiceError(400, "self_assignment", "recipient must be another user")
+        if in_reply_to_item_id is not None:
+            reply_target = conn.execute(
+                """
+                SELECT 1 FROM items
+                WHERE id = ? AND project_id = ? AND session_id = ?
+                  AND creator_id = ? AND recipient_id = ?
+                """,
+                (
+                    in_reply_to_item_id,
+                    project_id,
+                    session_id,
+                    recipient["id"],
+                    actor_id,
+                ),
+            ).fetchone()
+            if reply_target is None:
+                raise ServiceError(
+                    404,
+                    "item_not_found",
+                    "reply target not found for this route",
+                )
         open_count = conn.execute(
             """
             SELECT COUNT(*) AS count FROM items
@@ -2281,8 +2313,9 @@ class Service:
             """
             INSERT INTO items(
                 id, project_id, session_id, creator_id, recipient_id, work_claim_id,
-                title, body, risk_flags, completion_policy, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open.pending', ?, ?)
+                title, body, risk_flags, completion_policy, status, created_at, updated_at,
+                in_reply_to_item_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open.pending', ?, ?, ?)
             """,
             (
                 item_id,
@@ -2297,6 +2330,7 @@ class Service:
                 completion_policy,
                 now,
                 now,
+                in_reply_to_item_id,
             ),
         )
         event_seq = self._insert_event(
@@ -2437,6 +2471,7 @@ class Service:
                 metadata = item_response.get("trusted_metadata", {})
                 if "item_id" in metadata and "status" in metadata:
                     metadata.setdefault("completion_policy", "workflow")
+                    metadata.setdefault("in_reply_to_item_id", None)
             return MutationResult(existing["status_code"], response, replayed=True)
         status_code, response = mutate()
         response_json = json.dumps(
@@ -2524,6 +2559,7 @@ class Service:
                     "handle": row["recipient_handle"],
                 },
                 "work_claim": Service._linked_work_metadata(row),
+                "in_reply_to_item_id": row["in_reply_to_item_id"],
                 "status": row["status"],
                 "completion_policy": row["completion_policy"],
                 "version": row["version"],
@@ -2573,6 +2609,7 @@ class Service:
                     "handle": row["recipient_handle"],
                 },
                 "work_claim": Service._linked_work_metadata(row),
+                "in_reply_to_item_id": row["in_reply_to_item_id"],
                 "from_status": row["from_status"],
                 "to_status": row["to_status"],
                 "current_status": row["current_status"],

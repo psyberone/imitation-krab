@@ -19,12 +19,30 @@ external identifiers and assign available work. Members can atomically claim
 available work for themselves and submit completed work for independent
 review. A different coordinator or admin returns it for changes or approves
 and completes it while atomically sending the assignee a linked verdict item.
-A work item may carry one immutable link to a registry entry.
+A work item may independently carry one immutable link to a registry entry and
+one participant-private link to the exact earlier item it answers.
 
 The v0 daemon binds to `127.0.0.1` by default, uses SQLite, and has no runtime
 package dependencies beyond Python 3.11 or newer. Its explicit container mode
 binds the container namespace while the supplied Compose deployment publishes
 the API only on host loopback.
+
+## Release 0.7.0
+
+Version 0.7.0 adds one bounded integration primitive: an optional, immutable,
+server-attested reply binding between two private session items. A reply must
+point to an existing item on the exact reverse route in the same project and
+session. Krab attests that relationship only; it does not interpret the reply,
+change either item's status, acknowledge a receipt, or mutate a linked claim.
+
+The binding is participant-private metadata. It appears on item responses and
+private queue/inbox events, but never in the project-wide activity feed. This
+release migrates schema 7 to schema 8. Existing items receive a null binding
+without rewriting their content or history. Because the published response
+schemas are closed, strict consumers must accept the new required nullable
+field before upgrading the server. See the
+[0.7.0 roadmap](docs/krab-0.7.0-roadmap.md) for the exact contract and
+non-goals.
 
 ## Release 0.6.4
 
@@ -67,20 +85,13 @@ command or after the mutation subcommand. Every HTTP response carries an
 `X-Krab-Version` header so the CLI can report version skew without changing
 machine-readable stdout.
 
-## 0.7 inclusion candidates
-
-Version 0.7 is reserved for the bounded Magic Glass Box feature release. The
-first accepted item is an optional, immutable, server-attested reply binding
-for exact request/response correlation. Its contract, compatibility boundary,
-non-goals, and acceptance checks are defined in the
-[0.7.0 roadmap](docs/krab-0.7.0-roadmap.md).
+## Future inclusion candidates
 
 Other audit follow-ups remain candidates, not commitments: project-admin
 session lifecycle corrections, disabled-user recovery, response-schema
 completion, CLI/HTTP consistency, audit-history completion, and remaining
-state-directory hardening. A candidate enters 0.7 only when it directly
-supports that integration, closes a meaningful correctness gap, or is a small
-low-risk hardening change.
+state-directory hardening. They remain outside 0.7.0 unless separately accepted
+as a small, directly relevant correctness or hardening change.
 
 ## Security boundary
 
@@ -169,7 +180,7 @@ This checks only that the daemon responds to the health endpoint. It does not
 establish database readiness, authentication, project access, or overall
 operability; it is not a readiness probe.
 
-On success, JSON contains `{"status":"ok","server_version":"0.6.4"}`,
+On success, JSON contains `{"status":"ok","server_version":"0.7.0"}`,
 as defined by [`schemas/v1/health.schema.json`](schemas/v1/health.schema.json).
 `server_version` is the validated `X-Krab-Version` response header, or `null`
 for legacy servers that omit it. The probe honors `KRAB_SERVER` and `--server`,
@@ -240,14 +251,14 @@ docker compose ps
 curl --fail --silent http://127.0.0.1:8765/v1/health
 ```
 
-New images migrate an existing schema 1 through 6 database to schema 7 at
+New images migrate an existing schema 1 through 7 database to schema 8 at
 startup without deleting users, projects, sessions, messages, or claims. Take
 a verified backup before updating, then rebuild and recreate the service
 container:
 
 ```console
 docker compose --profile admin run --rm krab-admin \
-  admin backup "/var/lib/imitation-krab/backups/krab-before-v5.db"
+  admin backup "/var/lib/imitation-krab/backups/krab-before-v7.db"
 docker compose build --pull
 docker compose up --detach --force-recreate krab
 ```
@@ -619,6 +630,35 @@ independent: neither lifecycle silently changes the other. The CLI prints a
 notice for linked sends because an ordinary message is not a review verdict;
 use `claim-review` for an atomic verdict, claim transition, and notification.
 
+## Bind an exact reply
+
+When a new item answers one earlier item, the sender can bind it to that exact
+request without creating a general thread:
+
+```console
+krab send \
+  --project imitation-krab \
+  --session ses_0123456789abcdef0123456789abcdef \
+  --to primary-dev \
+  --title "Authentication review result" \
+  --body-file response.txt \
+  --in-reply-to itm_0123456789abcdef0123456789abcdef
+```
+
+The HTTP item-creation payload accepts the same relation as
+`in_reply_to_item_id`. The target must already exist in the same project and
+session, and the new creator/recipient must exactly reverse the target's
+recipient/creator. The relation is immutable and is part of the idempotency
+request: reusing a key with another target conflicts. Missing, inaccessible,
+cross-scope, and wrong-route targets all return the same scope-hiding
+`item_not_found` error.
+
+Every item response and private queue/inbox event includes the trusted field;
+it is `null` for unrelated and migrated items. Project activity deliberately
+omits it so ordinary project members cannot reconstruct private conversation
+topology. The binding does not change item status, handle a receipt, mutate a
+claim, or attest that the untrusted response prose is correct or sufficient.
+
 ## Status machine
 
 Statuses are fixed in code; they are not configurable workflows.
@@ -674,9 +714,11 @@ The per-creator/recipient/session route bound remains 100 open items, shared by
 both policies. A creator's `queue_limit` error includes only
 `details: {"limit":100,"open_items":100}`; handling frees a route slot.
 
-Schema 7 rebuilds the items table transactionally, preserving IDs, versions,
-claim links, indexes, triggers, history, and deliveries. Foreign-key integrity is
-checked before commit; a failed migration rolls back the schema and data.
+Schema 7 introduced completion policy by rebuilding the items table
+transactionally. Schema 8 adds the nullable reply link in place. Both
+migrations preserve IDs, versions, claim links, indexes, triggers, history, and
+deliveries. Foreign-key integrity is checked before commit; a failed migration
+rolls back the schema and data.
 
 Every update includes the version last observed by the caller:
 
@@ -761,6 +803,7 @@ Responses keep provenance separate from content:
     "item_id": "itm_...",
     "project_key": "imitation-krab",
     "session_id": "ses_...",
+    "in_reply_to_item_id": null,
     "status": "open.pending",
     "version": 1
   },

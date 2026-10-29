@@ -19,7 +19,7 @@ from .config import MAX_DATABASE_BYTES, default_db_path, default_pepper_path
 from .sanitize import sanitize_text, validate_handle, validate_project_key
 
 TOKEN_RE = re.compile(r"^krab_(usr_[0-9a-f]{32})_([A-Za-z0-9_-]{43})$")
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 SCHEMA = """
@@ -152,6 +152,7 @@ CREATE TABLE IF NOT EXISTS items (
     version INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
+    in_reply_to_item_id TEXT,
     UNIQUE (project_id, session_id, id),
     CHECK (creator_id <> recipient_id),
     CHECK (
@@ -162,7 +163,8 @@ CREATE TABLE IF NOT EXISTS items (
         REFERENCES session_members(project_id, session_id, user_id) ON DELETE RESTRICT,
     FOREIGN KEY (project_id, session_id, recipient_id)
         REFERENCES session_members(project_id, session_id, user_id) ON DELETE RESTRICT,
-    FOREIGN KEY (work_claim_id) REFERENCES work_claims(id) ON DELETE RESTRICT
+    FOREIGN KEY (work_claim_id) REFERENCES work_claims(id) ON DELETE RESTRICT,
+    FOREIGN KEY (in_reply_to_item_id) REFERENCES items(id) ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -262,6 +264,30 @@ FOR EACH ROW
 WHEN NEW.completion_policy IS NOT OLD.completion_policy
 BEGIN
     SELECT RAISE(ABORT, 'completion policy is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS items_reply_route_insert
+BEFORE INSERT ON items
+FOR EACH ROW
+WHEN NEW.in_reply_to_item_id IS NOT NULL
+ AND NOT EXISTS (
+    SELECT 1 FROM items parent
+    WHERE parent.id = NEW.in_reply_to_item_id
+      AND parent.project_id = NEW.project_id
+      AND parent.session_id = NEW.session_id
+      AND parent.creator_id = NEW.recipient_id
+      AND parent.recipient_id = NEW.creator_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'reply target is not available for this route');
+END;
+
+CREATE TRIGGER IF NOT EXISTS items_reply_link_immutable
+BEFORE UPDATE OF in_reply_to_item_id ON items
+FOR EACH ROW
+WHEN NEW.in_reply_to_item_id IS NOT OLD.in_reply_to_item_id
+BEGIN
+    SELECT RAISE(ABORT, 'reply link is immutable');
 END;
 
 CREATE TRIGGER IF NOT EXISTS items_work_claim_scope_project_update
@@ -427,6 +453,40 @@ MIGRATION_5_TO_6 = (
 )
 
 
+MIGRATION_7_TO_8 = (
+    """
+    ALTER TABLE items ADD COLUMN in_reply_to_item_id TEXT
+        REFERENCES items(id) ON DELETE RESTRICT
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS items_reply_route_insert
+    BEFORE INSERT ON items
+    FOR EACH ROW
+    WHEN NEW.in_reply_to_item_id IS NOT NULL
+     AND NOT EXISTS (
+        SELECT 1 FROM items parent
+        WHERE parent.id = NEW.in_reply_to_item_id
+          AND parent.project_id = NEW.project_id
+          AND parent.session_id = NEW.session_id
+          AND parent.creator_id = NEW.recipient_id
+          AND parent.recipient_id = NEW.creator_id
+     )
+    BEGIN
+        SELECT RAISE(ABORT, 'reply target is not available for this route');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS items_reply_link_immutable
+    BEFORE UPDATE OF in_reply_to_item_id ON items
+    FOR EACH ROW
+    WHEN NEW.in_reply_to_item_id IS NOT OLD.in_reply_to_item_id
+    BEGIN
+        SELECT RAISE(ABORT, 'reply link is immutable');
+    END
+    """,
+)
+
+
 class DatabaseError(RuntimeError):
     pass
 
@@ -568,7 +628,7 @@ class Database:
         version = rows[0]["version"]
         if version == SCHEMA_VERSION:
             return
-        if version not in {1, 2, 3, 4, 5, 6}:
+        if version not in {1, 2, 3, 4, 5, 6, 7}:
             raise DatabaseError("unsupported database schema version")
 
         conn.execute("PRAGMA foreign_keys = OFF")
@@ -578,7 +638,7 @@ class Database:
             if len(locked_rows) != 1:
                 raise DatabaseError("database schema metadata is invalid")
             locked_version = locked_rows[0]["version"]
-            if locked_version not in {1, 2, 3, 4, 5, 6, SCHEMA_VERSION}:
+            if locked_version not in {1, 2, 3, 4, 5, 6, 7, SCHEMA_VERSION}:
                 raise DatabaseError("unsupported database schema version")
             if locked_version == 1:
                 for statement in MIGRATION_1_TO_2:
@@ -632,6 +692,10 @@ class Database:
             if locked_version == 6:
                 self._migrate_receipt_policy(conn)
                 conn.execute("UPDATE schema_meta SET version = 7 WHERE version = 6")
+                locked_version = 7
+            if locked_version == 7:
+                self._migrate_reply_binding(conn)
+                conn.execute("UPDATE schema_meta SET version = 8 WHERE version = 7")
             if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise DatabaseError("database migration violates foreign-key integrity")
             conn.commit()
@@ -686,6 +750,16 @@ class Database:
                 SELECT RAISE(ABORT, 'completion policy is immutable');
             END
             """)
+
+    @staticmethod
+    def _migrate_reply_binding(conn: sqlite3.Connection) -> None:
+        columns = [row["name"] for row in conn.execute("PRAGMA table_info(items)")]
+        if not columns:
+            return
+        if "in_reply_to_item_id" not in columns:
+            conn.execute(MIGRATION_7_TO_8[0])
+        for statement in MIGRATION_7_TO_8[1:]:
+            conn.execute(statement)
 
     def backup(self, destination: Path | str) -> dict[str, Any]:
         """Create a consistent, private SQLite snapshot without overwriting."""

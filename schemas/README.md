@@ -40,6 +40,16 @@ recipient can handle them using the existing status endpoint with expected
 version and an idempotency key. Claim-review notifications are receipt items.
 Inbox acknowledgement remains independent of item completion.
 
+Krab 0.7.0 item and private queue/inbox event metadata also require
+`in_reply_to_item_id`, either null or an `itm_` identifier. Item creation accepts
+the field only as a non-null item identifier when supplied. A bound target must
+be a pre-existing item in the same project and session on the exact reverse
+creator/recipient route. The link is immutable and does not affect either
+item's lifecycle. Project activity events deliberately omit the field; exact
+private conversation topology is not project-visible. This required nullable
+response field is an additive wire change but a breaking change for strict
+consumers of the closed v1 schemas.
+
 Item creation accepts `completion_policy` as an optional string enum (`workflow`
 or `receipt`); null and other values are rejected. The field cannot be updated.
 Handling requests have `status: "closed.handled"`, a positive integer
