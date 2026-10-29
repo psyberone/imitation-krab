@@ -241,7 +241,7 @@ class Service:
         operation = f"work_claim.create:{project_key}:{kind}"
         conn = self.db.connect()
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            self._begin_actor_mutation(conn, actor)
 
             def mutate() -> tuple[int, dict[str, Any]]:
                 project = self._project_membership(conn, actor["id"], project_key)
@@ -356,7 +356,7 @@ class Service:
         operation = f"work_claim.import:{project_key}:{kind}"
         conn = self.db.connect()
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            self._begin_actor_mutation(conn, actor)
 
             def mutate() -> tuple[int, dict[str, Any]]:
                 project = self._project_membership(conn, actor["id"], project_key)
@@ -457,7 +457,7 @@ class Service:
         operation = f"work_claim.claim:{project_key}:{kind}:{claim_id}"
         conn = self.db.connect()
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            self._begin_actor_mutation(conn, actor)
 
             def mutate() -> tuple[int, dict[str, Any]]:
                 project = self._project_membership(conn, actor["id"], project_key)
@@ -540,7 +540,7 @@ class Service:
         operation = f"work_claim.assign:{project_key}:{kind}:{claim_id}"
         conn = self.db.connect()
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            self._begin_actor_mutation(conn, actor)
 
             def mutate() -> tuple[int, dict[str, Any]]:
                 project = self._project_membership(conn, actor["id"], project_key)
@@ -639,7 +639,7 @@ class Service:
         operation = f"work_claim.release:{project_key}:{kind}:{claim_id}"
         conn = self.db.connect()
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            self._begin_actor_mutation(conn, actor)
 
             def mutate() -> tuple[int, dict[str, Any]]:
                 project = self._project_membership(conn, actor["id"], project_key)
@@ -755,7 +755,7 @@ class Service:
         operation = f"work_claim.status:{project_key}:{kind}:{claim_id}"
         conn = self.db.connect()
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            self._begin_actor_mutation(conn, actor)
 
             def mutate() -> tuple[int, dict[str, Any]]:
                 project = self._project_membership(conn, actor["id"], project_key)
@@ -930,7 +930,7 @@ class Service:
         operation = f"work_claim.review:{project_key}:{kind}:{claim_id}"
         conn = self.db.connect()
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            self._begin_actor_mutation(conn, actor)
 
             def mutate() -> tuple[int, dict[str, Any]]:
                 project = self._project_membership(conn, actor["id"], project_key)
@@ -1072,6 +1072,7 @@ class Service:
         claim_id = self._valid_object_id(claim_id, "clm")
         conn = self.db.connect()
         try:
+            conn.execute("BEGIN")
             project = self._project_membership(conn, actor["id"], project_key)
             claim = self._work_claim_row(conn, project["id"], kind, claim_id)
             rows = conn.execute(
@@ -1162,7 +1163,7 @@ class Service:
         operation = f"session.create:{project_key}"
         conn = self.db.connect()
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            self._begin_actor_mutation(conn, actor)
 
             def mutate() -> tuple[int, dict[str, Any]]:
                 project = self._project_membership(conn, actor["id"], project_key)
@@ -1303,13 +1304,27 @@ class Service:
         operation = f"session.close:{project_key}:{session_id}"
         conn = self.db.connect()
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            self._begin_actor_mutation(conn, actor)
 
             def mutate() -> tuple[int, dict[str, Any]]:
                 project = self._project_membership(conn, actor["id"], project_key)
-                session = self._session_membership(
-                    conn, actor["id"], project["id"], session_id
-                )
+                if project["role"] == "admin":
+                    session = conn.execute(
+                        """
+                        SELECT id, state, created_by
+                        FROM sessions
+                        WHERE project_id = ? AND id = ?
+                        """,
+                        (project["id"], session_id),
+                    ).fetchone()
+                    if session is None:
+                        raise ServiceError(
+                            404, "scope_not_found", "session scope not found"
+                        )
+                else:
+                    session = self._session_membership(
+                        conn, actor["id"], project["id"], session_id
+                    )
                 if session["state"] == "closed":
                     raise ServiceError(
                         409, "session_closed", "session is already closed"
@@ -1409,7 +1424,7 @@ class Service:
             canonical["completion_policy"] = completion_policy
         conn = self.db.connect()
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            self._begin_actor_mutation(conn, actor)
 
             def mutate() -> tuple[int, dict[str, Any]]:
                 project = self._project_membership(conn, actor["id"], project_key)
@@ -1446,6 +1461,7 @@ class Service:
         item_id = self._valid_object_id(item_id, "itm")
         conn = self.db.connect()
         try:
+            conn.execute("BEGIN")
             project = self._project_membership(conn, actor["id"], project_key)
             self._session_membership(conn, actor["id"], project["id"], session_id)
             row = self._item_row(conn, project["id"], session_id, item_id, actor["id"])
@@ -1502,7 +1518,7 @@ class Service:
         operation = f"item.status:{project_key}:{session_id}:{item_id}"
         conn = self.db.connect()
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            self._begin_actor_mutation(conn, actor)
 
             def mutate() -> tuple[int, dict[str, Any]]:
                 project = self._project_membership(conn, actor["id"], project_key)
@@ -1613,7 +1629,7 @@ class Service:
         operation = f"item.remind:{project_key}:{session_id}:{item_id}"
         conn = self.db.connect()
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            self._begin_actor_mutation(conn, actor)
 
             def mutate() -> tuple[int, dict[str, Any]]:
                 project = self._project_membership(conn, actor["id"], project_key)
@@ -1732,6 +1748,7 @@ class Service:
         while True:
             conn = self.db.connect()
             try:
+                conn.execute("BEGIN")
                 self._require_current_actor(conn, actor)
                 project = self._project_membership(conn, actor["id"], project_key)
                 self._session_membership(conn, actor["id"], project["id"], session_id)
@@ -1838,6 +1855,7 @@ class Service:
         while True:
             conn = self.db.connect()
             try:
+                conn.execute("BEGIN")
                 self._require_current_actor(conn, actor)
                 project = self._project_membership(conn, actor["id"], project_key)
                 cursor = conn.execute(
@@ -2017,7 +2035,7 @@ class Service:
         operation = f"project_inbox.ack:{project_key}"
         conn = self.db.connect()
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            self._begin_actor_mutation(conn, actor)
 
             def mutate() -> tuple[int, dict[str, Any]]:
                 project = self._project_membership(conn, actor["id"], project_key)
@@ -2089,6 +2107,13 @@ class Service:
             raise
         finally:
             conn.close()
+
+    @staticmethod
+    def _begin_actor_mutation(
+        conn: sqlite3.Connection, actor: dict[str, Any]
+    ) -> None:
+        conn.execute("BEGIN IMMEDIATE")
+        Service._require_current_actor(conn, actor)
 
     @staticmethod
     def _require_current_actor(
