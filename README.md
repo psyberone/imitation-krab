@@ -44,6 +44,25 @@ field before upgrading the server. See the
 [0.7.0 roadmap](docs/krab-0.7.0-roadmap.md) for the exact contract and
 non-goals.
 
+## Release 0.6.5
+
+Version 0.6.5 is a compatibility-preserving correctness and recovery release.
+It keeps database schema 7 and adds no HTTP route or response-shape changes.
+Authenticated API mutations now revalidate the actor's active state and token
+version inside the write transaction, so credential rotation or disablement
+also revokes an already-authenticated mutation before it can commit.
+
+Local operators can atomically rotate and reactivate a disabled identity with
+`admin user-recover`. A project admin who knows a session ID can close a
+completed session without first being a session participant, while session
+listing remains participant-scoped. Item, claim, and inbox responses now read
+their related state from one SQLite snapshot.
+
+This release also prevents concurrent initialization from adding duplicate
+schema metadata, rejects backups containing foreign-key violations, completes
+short pepper and token-file writes, and closes HTTP connections after request
+body timeouts or unexpected server/database failures.
+
 ## Release 0.6.4
 
 Version 0.6.4 adds a bounded, credential-free `krab health` liveness probe for
@@ -87,11 +106,12 @@ machine-readable stdout.
 
 ## Future inclusion candidates
 
-Other audit follow-ups remain candidates, not commitments: project-admin
-session lifecycle corrections, disabled-user recovery, response-schema
-completion, CLI/HTTP consistency, audit-history completion, and remaining
-state-directory hardening. They remain outside 0.7.0 unless separately accepted
-as a small, directly relevant correctness or hardening change.
+Other audit follow-ups remain candidates, not commitments: response-schema
+completion, CLI/HTTP consistency, audit-history completion, resource and
+migration headroom, and remaining state-directory hardening. They remain
+outside 0.7.0 and may enter a later point release only when directly required
+by the bounded Magic Glass Box integration or accepted as a small, low-risk
+correctness fix.
 
 ## Security boundary
 
@@ -280,7 +300,14 @@ mode `0600`, uses rollback-journal format, and can safely be copied out of the
 backup volume after the command completes. It contains plaintext message data,
 so encrypt exported copies and manage their retention. Do not copy the live
 data volume. Backup opens an existing source read-only and preserves its schema
-version; it never creates or upgrades the source database.
+version; it never creates or upgrades the source database. The completed copy
+must pass both SQLite's structural check and its foreign-key check or it is
+deleted and the command fails.
+
+The database snapshot is not a complete authentication recovery artifact by
+itself: its token digests require the matching pepper from the separately
+protected pepper volume. Keep and test a separately protected paired recovery
+procedure without combining the pepper into ordinary database backups.
 
 `docker compose down` removes containers and the network but retains state.
 For a complete, irreversible reset, activate the admin profile so Compose also
@@ -332,7 +359,22 @@ Token files are created with mode `0600`. The CLI refuses symlinked or
 hard-linked token files, non-owned files, group/world-accessible files, and
 token directories not owned by the current user with mode `0700`. If
 `--write-token` is omitted, the token is printed exactly once. A failed token
-file write rolls back the associated user creation or credential rotation.
+file write rolls back the associated user creation, credential rotation, or
+disabled-user recovery.
+
+Recover a disabled identity without ever making its old credential valid
+again:
+
+```console
+krab admin user-recover worker-one \
+  --write-token ~/.config/imitation-krab/worker-one.token
+```
+
+Recovery is accepted only for an existing disabled identity. It generates a
+new bearer token, increments the token version, and reactivates the identity in
+one local transaction. Use `admin user-rotate` for an identity that is still
+active. These remain local-only administrative operations; there is no remote
+recovery endpoint.
 
 Project roles are deliberately fixed:
 
@@ -340,12 +382,16 @@ Project roles are deliberately fixed:
 | --- | --- |
 | `member` | Read claim queues, self-claim, activate or submit assigned work, release claimed/active work, and participate in sessions |
 | `coordinator` | Member capabilities plus claim creation/import, explicit assignment, atomic review of another assignee's work, and stale/review-claim release |
-| `admin` | Coordinator capabilities plus project-level override such as closing another creator's completed session |
+| `admin` | Coordinator capabilities plus project-level override such as closing another creator's completed session by known ID |
 
 No role can create users, rotate credentials, or change membership over HTTP.
 Those operations remain local administrative commands. Keep the human
 administrator's token outside agent workspaces; give the primary development
 agent only the `coordinator` token.
+
+The ordinary session list remains participant-scoped for every role. An admin
+close override does not make private session labels or history project-wide;
+the operator must already have the exact session ID.
 
 Start the daemon:
 

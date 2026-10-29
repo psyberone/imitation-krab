@@ -57,6 +57,9 @@ the raw bearer token in model context.
 18. An item reply link is optional and immutable. Its target must pre-exist in
     the same project and session on the exact reverse creator/recipient route.
     Only item participants can observe the link; project activity omits it.
+19. An authenticated mutation revalidates the actor's active state and token
+    version after acquiring its SQLite write lock and before replaying or
+    committing the operation.
 
 ## Trust boundaries
 
@@ -124,7 +127,7 @@ content.
 | --- | --- |
 | Unauthenticated local process | 256-bit bearer credentials, constant-time digest comparison, generic authentication errors |
 | Stolen database | Token digests are keyed with a separate 256-bit pepper; raw tokens are never stored |
-| Stolen bearer token | Per-user least privilege, immediate rotation/revocation including in-flight long polls, project/session membership, rate limits |
+| Stolen bearer token | Per-user least privilege, transactional credential revalidation for mutations, immediate rotation/revocation of in-flight long polls, project/session membership, rate limits |
 | Cross-project or cross-session access | Scoped route checks plus composite SQLite foreign keys |
 | Sender impersonation | Sender always comes from authentication; no accepted `sender_id` field |
 | Work-item bait-and-switch | Delivered title/body/scope/parties are immutable |
@@ -182,8 +185,11 @@ server pepper. Tokens are displayed once or written to a new mode-`0600` file
 inside an owned mode-`0700` directory. The client refuses token symlinks, hard
 links, non-owned files, and group/world-readable files. File delivery occurs
 inside the identity transaction, so a failed write rolls back creation or
-rotation. If an existing database has no pepper, startup fails closed; Krab
-does not manufacture a replacement that would invalidate every token.
+rotation or disabled-user recovery. A disabled identity can be recovered only
+by atomically generating a new token, incrementing its token version, and
+reactivating it; the old token never becomes valid again. If an existing
+database has no pepper, startup fails closed; Krab does not manufacture a
+replacement that would invalidate every token.
 
 Token possession is authentication. If multiple agents run under the same OS
 account with unrestricted filesystem or process access, they may be able to
@@ -225,10 +231,11 @@ checks limit other users' data, not that user's own blast radius.
   can send security discussions, URLs, prompts, and command names unchanged;
   recipients apply any workflow-specific policy outside the mailbox.
 - A fully compromised daemon account or host can alter state and credentials.
-- The one-second incomplete-header deadline bounds how long one idle connection
-  occupies a request slot. It does not make the daemon immune to a hostile local
-  process that continuously opens new sockets; OS/container isolation remains
-  the boundary for that process.
+- The one-second socket inactivity timeout bounds a completely stalled header or
+  body read and such body timeouts close the connection. It is not a cumulative
+  request deadline: a local peer that continuously makes progress can occupy a
+  request slot for longer. OS/container isolation remains the boundary for a
+  hostile local process that continuously opens or slowly feeds sockets.
 - A compromised authenticated agent can perform every operation granted to its
   identity until the token is revoked.
 - `--write-token` performs file delivery before committing the SQLite identity
@@ -265,7 +272,9 @@ checks limit other users' data, not that user's own blast radius.
   can still consume that allowance and deny future writes until an operator
   intervenes.
 - Backup-volume retention is operator-managed, and exported snapshots contain
-  plaintext message data.
+  plaintext message data. A snapshot is checked for SQLite structural and
+  foreign-key integrity, but authentication recovery also requires the matching
+  separately protected pepper and an operator-tested paired restore procedure.
 - The service cannot enforce filesystem work assignments. Its ownership model
   is cooperative outside the database.
 - SQLite files must not be copied live as an ad hoc backup while WAL mode is in
@@ -283,8 +292,10 @@ reverse-route scope enforcement, activity omission, queue privacy,
 atomic claim ownership, coordinator/admin creation and assignment boundaries, additive
 import behavior, independent review and self-approval denial, exact scoped
 claim filters, release boundaries, and reminder throttling.
-Credential revocation must also cover in-flight long polls; failed-authentication
-throttling must not reject a valid credential; pepper loss must fail closed;
-inventory and backup must not create or migrate source state; rejected request
-bodies must close their connection; and token-file delivery failures must roll
-back their identity mutation.
+Credential revocation must also cover in-flight long polls and actors already
+authenticated before an API mutation; failed-authentication throttling must not
+reject a valid credential; disabled-user recovery must rotate rather than
+restore the old token; pepper loss must fail closed; inventory and backup must
+not create or migrate source state; backup must reject foreign-key corruption;
+rejected or timed-out request bodies must close their connection; and short or
+failed credential writes must not be reported as successful identity delivery.

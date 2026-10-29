@@ -31,6 +31,7 @@ from .config import (
 )
 from .db import TOKEN_RE, Database, DatabaseError
 from .http_api import serve
+from .io_utils import write_all
 from .sanitize import ValidationError, terminal_lines, validate_external_id
 
 STATUS_ALIASES = {
@@ -270,6 +271,11 @@ def build_parser() -> argparse.ArgumentParser:
     user_rotate = admin_sub.add_parser("user-rotate")
     user_rotate.add_argument("handle")
     user_rotate.add_argument("--write-token", type=Path)
+    user_recover = admin_sub.add_parser(
+        "user-recover", help="rotate and reactivate a disabled identity"
+    )
+    user_recover.add_argument("handle")
+    user_recover.add_argument("--write-token", type=Path)
     user_disable = admin_sub.add_parser("user-disable")
     user_disable.add_argument("handle")
     admin_sub.add_parser("user-list", help="list local identities without credentials")
@@ -562,6 +568,16 @@ def _run_admin(args: argparse.Namespace, database: Database) -> int:
                 args.write_token, token, replace=True
             )
         user, token = database.rotate_user_token(
+            args.handle, token_delivery=delivery
+        )
+        _emit_token_result(args, user, token, args.write_token)
+    elif command == "user-recover":
+        delivery = None
+        if args.write_token is not None:
+            delivery = lambda token: _write_token(
+                args.write_token, token, replace=True
+            )
+        user, token = database.recover_user_token(
             args.handle, token_delivery=delivery
         )
         _emit_token_result(args, user, token, args.write_token)
@@ -999,7 +1015,7 @@ def _write_token(path: Path, token: str, *, replace: bool) -> None:
         except FileExistsError as exc:
             raise ClientError(f"refusing to overwrite token file: {path}") from exc
         try:
-            os.write(fd, token.encode("ascii") + b"\n")
+            write_all(fd, token.encode("ascii") + b"\n")
             os.fsync(fd)
         except Exception:
             os.close(fd)

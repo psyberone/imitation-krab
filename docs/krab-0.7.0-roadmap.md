@@ -1,8 +1,8 @@
 # Krab 0.7.0 MGB integration roadmap
 
-- **Status:** reply binding implemented and verified on the `0.7.0` branch;
-  release not yet deployed
-- **Baseline:** current `main` after receipt-policy delivery / schema 7
+- **Status:** reply binding and the 0.6.5 hardening baseline are merged and
+  verified on the `0.7.0` branch; release deployment remains
+- **Baseline:** version 0.6.5 / schema 7
 - **Release purpose:** provide the smallest server-attested transport relation
   needed for Magic Glass Box interactions without importing orchestration
   policy into Krab
@@ -145,4 +145,6 @@ The reply relation does not:
 10. Existing claim links, completion policies, private authorization, and
     text-provenance boundaries remain unchanged.
 
-Other audit follow-ups remain candidates rather than implied 0.7.0 scope.
+Other audit follow-ups are not implied 0.7.0 scope. A bounded change found to
+be necessary during Magic Glass Box integration may be evaluated for a later
+0.7.x point release without expanding this feature release.

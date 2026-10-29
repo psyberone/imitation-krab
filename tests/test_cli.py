@@ -900,7 +900,8 @@ class CLIBehaviorTests(unittest.TestCase):
 
             result, output, _ = invoke("admin", "user-create", "dev")
             self.assertEqual(result, 0)
-            self.assertRegex(json.loads(output)["token"], r"^krab_usr_")
+            dev_token = json.loads(output)["token"]
+            self.assertRegex(dev_token, r"^krab_usr_")
 
             self.assertEqual(
                 invoke("admin", "project-create", "project-one", "--label", "One")[
@@ -1018,6 +1019,27 @@ class CLIBehaviorTests(unittest.TestCase):
             self.assertFalse(updated_members["dev"]["active"])
             self.assertEqual(updated_members["owner"]["token_version"], 2)
 
+            dev_token_file = root / "dev.token"
+            result, output, _ = invoke(
+                "admin",
+                "user-recover",
+                "dev",
+                "--write-token",
+                str(dev_token_file),
+            )
+            self.assertEqual(result, 0)
+            self.assertEqual(json.loads(output)["credential_delivery"], "file")
+            recovered_token = _read_token(dev_token_file)
+            self.assertNotEqual(recovered_token, dev_token)
+            self.assertIsNone(Database(database).authenticate(dev_token))
+            recovered_actor = Database(database).authenticate(recovered_token)
+            assert recovered_actor
+            self.assertEqual(recovered_actor["token_version"], 2)
+
+            result, _, error = invoke("admin", "user-recover", "dev")
+            self.assertEqual(result, 1)
+            self.assertIn("use user-rotate", error)
+
             result, _, error = invoke(
                 "admin", "project-members", "missing-project"
             )
@@ -1118,6 +1140,31 @@ class CLIBehaviorTests(unittest.TestCase):
             _write_token(token_file, replacement, replace=True)
             self.assertEqual(_read_token(token_file), replacement)
             self.assertEqual(stat.S_IMODE(token_file.stat().st_mode), 0o600)
+
+            short_file = root / "short-write-token"
+            original_write = os.write
+            calls = 0
+
+            def short_write(fd: int, data: bytes | memoryview) -> int:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise InterruptedError
+                return original_write(fd, bytes(data)[:1])
+
+            with patch(
+                "imitation_krab.io_utils.os.write", side_effect=short_write
+            ):
+                _write_token(short_file, TOKEN, replace=False)
+            self.assertGreater(calls, 1)
+            self.assertEqual(_read_token(short_file), TOKEN)
+
+            zero_file = root / "zero-write-token"
+            with patch(
+                "imitation_krab.io_utils.os.write", return_value=0
+            ), self.assertRaisesRegex(OSError, "made no progress"):
+                _write_token(zero_file, TOKEN, replace=False)
+            self.assertFalse(zero_file.exists())
 
             missing = root / "missing"
             with self.assertRaisesRegex(ClientError, "not found"):
