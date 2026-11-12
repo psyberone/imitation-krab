@@ -28,6 +28,18 @@ taken from the validated response header (or `null` for legacy servers).
 | `admin project-list` | `v1/admin-project-list.schema.json` |
 | `admin project-members` | `v1/admin-project-members.schema.json` |
 
+The issue and pull-request list endpoints accept optional single-valued query
+parameters `status`, `assignee`, and `external_id`, combined with AND. The CLI
+exposes the latter as `issues --external-id EXACT` / `prs --external-id EXACT`.
+`external_id` must match `^[A-Za-z0-9][A-Za-z0-9._:/#-]{0,255}$` and uses exact,
+case-sensitive equality with the stored identifier. Encode reserved characters
+in HTTP queries (`#` as `%23`). No URL parsing or normalization occurs. Project
+and kind remain scoped; a match yields at most one claim, and a miss is a 200
+response with an empty `claims` array. Blank or malformed identifiers, repeated
+or unknown parameters, and queries exceeding the existing ten-field bound are
+rejected with 400. `v1/claim-list.schema.json` retains its response envelope;
+no filter metadata is added. `claims --mine` is unchanged.
+
 The schemas describe responses, not permissions. A syntactically valid response
 does not authorize an operation, prove GitHub state, or make `untrusted_text`
 safe to interpret as instructions.

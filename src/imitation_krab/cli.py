@@ -491,6 +491,10 @@ def _add_claim_list_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--project", required=True)
     parser.add_argument("--status", choices=sorted(CLAIM_STATUS_ALIASES))
     parser.add_argument("--assignee")
+    parser.add_argument(
+        "--external-id", metavar="EXACT",
+        help="match the stored external ID exactly (case-sensitive; no URL parsing)",
+    )
 
 
 def _add_mutation_retry_arg(parser: argparse.ArgumentParser) -> None:
@@ -672,6 +676,8 @@ def _run_client(args: argparse.Namespace, client: APIClient) -> int:
             query["status"] = CLAIM_STATUS_ALIASES[args.status]
         if args.assignee is not None:
             query["assignee"] = args.assignee
+        if args.external_id is not None:
+            query["external_id"] = args.external_id
         result = client.request(
             "GET",
             f"/v1/projects/{_segment(args.project)}/{queue}",

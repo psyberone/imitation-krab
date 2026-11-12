@@ -129,6 +129,33 @@ class StrictJSONTests(unittest.TestCase):
 
 
 class HTTPAPITests(unittest.TestCase):
+    def test_external_id_queue_filter_and_query_bounds(self) -> None:
+        for queue in ("issues", "pull-requests"):
+            path = f"/v1/projects/project-one/{queue}"
+            status, created, _ = self.request(
+                "POST", path, self.primary_token, {"external_id": "Owner/repo#7"},
+                key=f"filter-create-{queue}",
+            )
+            self.assertEqual(status, 201, created)
+            for query, count in (
+                ("external_id=Owner%2Frepo%237", 1),
+                ("external_id=Owner%2Frepo%237&status=available", 1),
+                ("external_id=Owner%2Frepo%237&status=claimed&assignee=bob", 0),
+                ("external_id=owner%2Frepo%237", 0),
+                ("external_id=missing", 0),
+            ):
+                status, result, _ = self.request("GET", f"{path}?{query}", self.bob_token)
+                self.assertEqual(status, 200, result)
+                self.assertEqual(len(result["claims"]), count)
+            for query in (
+                "external_id=", "external_id=" + "x" * 257,
+                "external_id=has+space", "external_id=%C3%A9", "external_id=x%0A",
+                "external_id=x&external_id=y", "external_id=x&unknown=y",
+                "external_id=x&" + "&".join(f"field{index}=x" for index in range(10)),
+            ):
+                status, result, _ = self.request("GET", f"{path}?{query}", self.bob_token)
+                self.assertEqual(status, 400, result)
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         root = Path(self.temporary.name)
@@ -970,7 +997,7 @@ class HTTPAPITests(unittest.TestCase):
 
         status, filtered, _ = self.request(
             "GET",
-            f"{issue_path}?status=under_review&assignee=bob",
+            f"{issue_path}?status=under_review&assignee=bob&external_id=owner%2Frepository%23501",
             self.primary_token,
         )
         self.assertEqual(status, 200, filtered)
