@@ -26,6 +26,22 @@ package dependencies beyond Python 3.11 or newer. Its explicit container mode
 binds the container namespace while the supplied Compose deployment publishes
 the API only on host loopback.
 
+## Release 0.6.6
+
+Version 0.6.6 closes the 0.6 release line with a foreground, one-shot inbox
+wait for agent tool calls. `krab wait --project PROJECT --after SEQ` repeatedly
+uses the existing bounded inbox long poll and returns as soon as the first
+nonempty response arrives. Its overall timeout defaults to one hour, is
+explicitly bounded at 24 hours, and never acknowledges an inbox cursor or
+changes work-item state. Transport interruptions retry with bounded backoff
+inside the original deadline; authentication, authorization, validation, and
+rate-limit errors remain terminal.
+
+CLI help now identifies session participants as project member handles, rejects
+`usr_...` IDs locally, and documents the shared 16 KiB UTF-8 limit for inline
+and file-backed message bodies. This release keeps database schema 7 and adds
+no server route, wire-schema, or authorization changes.
+
 ## Release 0.6.5
 
 Version 0.6.5 is a compatibility-preserving correctness and recovery release.
@@ -182,7 +198,7 @@ This checks only that the daemon responds to the health endpoint. It does not
 establish database readiness, authentication, project access, or overall
 operability; it is not a readiness probe.
 
-On success, JSON contains `{"status":"ok","server_version":"0.6.5"}`,
+On success, JSON contains `{"status":"ok","server_version":"0.6.6"}`,
 as defined by [`schemas/v1/health.schema.json`](schemas/v1/health.schema.json).
 `server_version` is the validated `X-Krab-Version` response header, or `null`
 for legacy servers that omit it. The probe honors `KRAB_SERVER` and `--server`,
@@ -399,6 +415,10 @@ krab --token-file ~/.config/imitation-krab/primary-dev.token \
   --participant worker-one
 ```
 
+`--participant HANDLE` takes a project member's handle, such as `worker-one`,
+not a stable `usr_...` user ID. Repeat the option for each participant. The CLI
+rejects `usr_...` participants locally before sending a request.
+
 The response contains a server-generated session ID. Use it for every work
 item in that unit of work:
 
@@ -411,6 +431,12 @@ krab --token-file ~/.config/imitation-krab/primary-dev.token \
   --title "Review authentication changes" \
   --body-file request.txt
 ```
+
+Both `send --body` and `send --body-file` accept at most 16 KiB (16,384 bytes)
+of UTF-8 text. This is a byte limit, not a character limit: visible Unicode
+characters may take multiple bytes. A body exactly at the limit is accepted
+if it meets the other text constraints; a larger body is rejected by the server
+with `body exceeds 16384 UTF-8 bytes`. A file's trailing newline counts too.
 
 The worker can watch only its own private deliveries:
 
@@ -441,6 +467,23 @@ the per-user/project cursor explicitly:
 ```console
 krab inbox-ack --project imitation-krab --through 1234
 ```
+
+For a foreground agent tool call that should remain blocked until one delivery
+arrives, use the project-wide one-shot wait:
+
+```console
+krab wait --project imitation-krab --after 1234 --timeout 28800
+```
+
+`wait` repeatedly makes server polls of at most 30 seconds, returns the first
+nonempty ordinary inbox envelope, and exits. If its overall timeout expires
+after successful empty polls, it returns the last empty envelope and exits
+successfully. The default timeout is 3,600 seconds and the maximum is 86,400
+seconds. `--timeout 0` performs one immediate read. A transport outage retries
+only within that same deadline and remains an error if no server response is
+obtained. Intermediate empty responses are never printed, so `--json` produces
+exactly one document. The supplied `--after` cursor is retained throughout;
+the command does not acknowledge, handle, close, or otherwise mutate anything.
 
 `inbox --unread` resumes strictly after that server-side cursor. An
 acknowledgement cannot move backwards or beyond an event actually delivered to
@@ -826,7 +869,7 @@ GitHub or permission to perform any external action.
 
 - Request body: 32 KiB
 - Incomplete request headers: 1-second connection deadline
-- Work-item body: 16 KiB
+- Work-item body: 16 KiB (16,384 UTF-8 bytes), shared by `--body` and `--body-file`
 - Status note: 4 KiB
 - Title: 512 UTF-8 bytes
 - Queue page: 100 events

@@ -117,7 +117,301 @@ def item_payload() -> dict:
     }
 
 
+def inbox_payload(*, events: list[dict] | None = None, next_cursor: int = 7) -> dict:
+    return {
+        "trusted_metadata": {
+            "project_key": "project-one",
+            "after": 7,
+            "next_cursor": next_cursor,
+            "acked_through": 0,
+            "unread": False,
+        },
+        "events": events or [],
+    }
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
 class CLIBehaviorTests(unittest.TestCase):
+    def test_session_help_uses_participant_handles(self) -> None:
+        self.assertIn("handles", build_parser().format_help())
+        output = StringIO()
+        with redirect_stdout(output), self.assertRaises(SystemExit) as caught:
+            main(["session-create", "--help"])
+        self.assertEqual(caught.exception.code, 0)
+        self.assertIn("--participant HANDLE", output.getvalue())
+        self.assertIn("handle", output.getvalue())
+
+    def test_session_participant_id_fails_locally_before_client_creation(self) -> None:
+        for participants in (["usr_" + "a" * 32], ["alice", "usr_bad"]):
+            arguments = [
+                "session-create",
+                "--project",
+                "project-one",
+                "--label",
+                "Review",
+            ]
+            for participant in participants:
+                arguments.extend(["--participant", participant])
+            output = StringIO()
+            with (
+                patch("imitation_krab.cli.APIClient") as client,
+                redirect_stderr(output),
+                self.assertRaises(SystemExit) as caught,
+            ):
+                main(arguments)
+            self.assertEqual(caught.exception.code, 2)
+            client.assert_not_called()
+            self.assertIn("--participant", output.getvalue())
+            self.assertIn("handle", output.getvalue())
+            self.assertIn("usr_", output.getvalue())
+
+    def test_send_help_documents_both_body_source_limits(self) -> None:
+        output = StringIO()
+        with redirect_stdout(output), self.assertRaises(SystemExit) as caught:
+            main(["send", "--help"])
+        self.assertEqual(caught.exception.code, 0)
+        for option in ("--body BODY", "--body-file BODY_FILE"):
+            description = output.getvalue().split(option)[-1].split("\n  --")[0]
+            self.assertIn("16 KiB", description)
+            self.assertIn("UTF-8", description)
+
+    def test_wait_help_and_argument_bounds(self) -> None:
+        output = StringIO()
+        with redirect_stdout(output), self.assertRaises(SystemExit) as caught:
+            main(["wait", "--help"])
+        self.assertEqual(caught.exception.code, 0)
+        help_text = output.getvalue()
+        self.assertIn("--after SEQ", help_text)
+        self.assertIn("--timeout", help_text)
+        self.assertIn("3600", help_text)
+        self.assertIn("86400", help_text)
+
+        defaults = parse_args([
+            "wait", "--project", "project-one", "--after", "0",
+        ])
+        self.assertEqual((defaults.timeout, defaults.limit), (3600, 50))
+        valid = parse_args([
+            "wait", "--project", "project-one", "--after", "0",
+            "--timeout", "86400", "--limit", "100",
+        ])
+        self.assertEqual((valid.after, valid.timeout, valid.limit), (0, 86400, 100))
+
+        for option, value in (
+            ("--after", "-1"),
+            ("--timeout", "-1"),
+            ("--timeout", "not-a-number"),
+            ("--timeout", "86401"),
+            ("--limit", "0"),
+            ("--limit", "101"),
+        ):
+            arguments = [
+                "wait", "--project", "project-one", "--after", "7",
+                "--timeout", "60", "--limit", "50",
+            ]
+            arguments[arguments.index(option) + 1] = value
+            with (
+                self.subTest(option=option, value=value),
+                redirect_stderr(StringIO()),
+                self.assertRaises(SystemExit) as invalid,
+            ):
+                parse_args(arguments)
+            self.assertEqual(invalid.exception.code, 2)
+
+    def test_wait_emits_only_first_nonempty_inbox_result(self) -> None:
+        clock = FakeClock()
+        client = Mock()
+        responses = [
+            (inbox_payload(next_cursor=70), 30),
+            (inbox_payload(next_cursor=71), 30),
+            (inbox_payload(events=[event_payload()], next_cursor=12), 4),
+        ]
+
+        def request(method, path, **kwargs):
+            response, elapsed = responses.pop(0)
+            clock.now += elapsed
+            return response
+
+        client.request.side_effect = request
+        output = StringIO()
+        args = parse_args([
+            "wait", "--project", "project-one", "--after", "7",
+            "--timeout", "90", "--limit", "8",
+        ])
+        with (
+            patch("imitation_krab.cli.time.monotonic", side_effect=clock.monotonic),
+            patch("imitation_krab.cli.time.sleep", side_effect=clock.sleep),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(_run_client(args, client), 0)
+
+        self.assertEqual(json.loads(output.getvalue())["events"], [event_payload()])
+        self.assertEqual(len(client.request.call_args_list), 3)
+        for request_call in client.request.call_args_list:
+            self.assertEqual(request_call.args, (
+                "GET", "/v1/projects/project-one/inbox",
+            ))
+            self.assertEqual(request_call.kwargs["query"]["after"], 7)
+            self.assertEqual(request_call.kwargs["query"]["limit"], 8)
+            self.assertLessEqual(request_call.kwargs["query"]["wait"], 30)
+        self.assertEqual(
+            [request_call.kwargs["query"]["wait"] for request_call in client.request.call_args_list],
+            [30, 30, 30],
+        )
+
+    def test_wait_timeout_returns_last_empty_envelope_without_advancing_cursor(self) -> None:
+        clock = FakeClock()
+        client = Mock()
+
+        def request(method, path, **kwargs):
+            clock.now += kwargs["query"]["wait"]
+            return inbox_payload(next_cursor=999)
+
+        client.request.side_effect = request
+        output = StringIO()
+        args = parse_args([
+            "wait", "--project", "project-one", "--after", "7",
+            "--timeout", "65",
+        ])
+        with (
+            patch("imitation_krab.cli.time.monotonic", side_effect=clock.monotonic),
+            patch("imitation_krab.cli.time.sleep", side_effect=clock.sleep),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(_run_client(args, client), 0)
+
+        self.assertEqual(json.loads(output.getvalue()), inbox_payload(next_cursor=999))
+        self.assertEqual(
+            [request_call.kwargs["query"] for request_call in client.request.call_args_list],
+            [
+                {"after": 7, "limit": 50, "wait": 30},
+                {"after": 7, "limit": 50, "wait": 30},
+                {"after": 7, "limit": 50, "wait": 5},
+            ],
+        )
+
+    def test_wait_retries_transport_failures_within_original_deadline(self) -> None:
+        clock = FakeClock()
+        client = Mock()
+        attempts = [
+            ServerUnavailable("offline one"),
+            ServerUnavailable("offline two"),
+            inbox_payload(events=[event_payload()], next_cursor=12),
+        ]
+
+        def request(method, path, **kwargs):
+            result = attempts.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        client.request.side_effect = request
+        output = StringIO()
+        error = StringIO()
+        args = parse_args([
+            "wait", "--project", "project-one", "--after", "7",
+            "--timeout", "10",
+        ])
+        with (
+            patch("imitation_krab.cli.time.monotonic", side_effect=clock.monotonic),
+            patch("imitation_krab.cli.time.sleep", side_effect=clock.sleep),
+            redirect_stdout(output),
+            redirect_stderr(error),
+        ):
+            self.assertEqual(_run_client(args, client), 0)
+
+        self.assertEqual(clock.sleeps, [1, 2])
+        self.assertIn("wait disconnected", error.getvalue())
+        self.assertIn("wait resumed", error.getvalue())
+        self.assertEqual(len(json.loads(output.getvalue())["events"]), 1)
+        self.assertEqual(
+            [request_call.kwargs["query"]["after"] for request_call in client.request.call_args_list],
+            [7, 7, 7],
+        )
+
+    def test_wait_does_not_mask_terminal_or_prolonged_transport_errors(self) -> None:
+        terminal = Mock()
+        terminal.request.side_effect = ClientError("rate_limit: slow down")
+        args = parse_args([
+            "wait", "--project", "project-one", "--after", "7",
+            "--timeout", "10",
+        ])
+        with self.assertRaisesRegex(ClientError, "rate_limit"):
+            _run_client(args, terminal)
+        self.assertEqual(terminal.request.call_count, 1)
+
+        clock = FakeClock()
+        unavailable = Mock()
+        unavailable.request.side_effect = ServerUnavailable("still offline")
+        short = parse_args([
+            "wait", "--project", "project-one", "--after", "7",
+            "--timeout", "2",
+        ])
+        with (
+            patch("imitation_krab.cli.time.monotonic", side_effect=clock.monotonic),
+            patch("imitation_krab.cli.time.sleep", side_effect=clock.sleep),
+            redirect_stderr(StringIO()),
+            self.assertRaisesRegex(ServerUnavailable, "still offline"),
+        ):
+            _run_client(short, unavailable)
+        self.assertEqual(clock.sleeps, [1, 1])
+        self.assertEqual(unavailable.request.call_count, 2)
+
+    def test_wait_zero_timeout_performs_one_immediate_read(self) -> None:
+        client = RecordingClient(inbox_payload())
+        output = StringIO()
+        args = parse_args([
+            "wait", "--project", "project-one", "--after", "7",
+            "--timeout", "0",
+        ])
+        with redirect_stdout(output):
+            self.assertEqual(_run_client(args, client), 0)
+        self.assertEqual(json.loads(output.getvalue()), inbox_payload())
+        self.assertEqual(client.calls, [(
+            "GET", "/v1/projects/project-one/inbox",
+            {"query": {"after": 7, "limit": 50, "wait": 0}},
+        )])
+
+    def test_wait_uses_the_fractional_deadline_without_spinning(self) -> None:
+        clock = FakeClock()
+        client = Mock()
+
+        def request(method, path, **kwargs):
+            if client.request.call_count == 1:
+                clock.now += 0.5
+            return inbox_payload()
+
+        client.request.side_effect = request
+        output = StringIO()
+        args = parse_args([
+            "wait", "--project", "project-one", "--after", "7",
+            "--timeout", "1",
+        ])
+        with (
+            patch("imitation_krab.cli.time.monotonic", side_effect=clock.monotonic),
+            patch("imitation_krab.cli.time.sleep", side_effect=clock.sleep),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(_run_client(args, client), 0)
+
+        self.assertEqual(clock.sleeps, [0.5])
+        self.assertEqual(
+            [entry.kwargs["query"]["wait"] for entry in client.request.call_args_list],
+            [1],
+        )
+        self.assertEqual(json.loads(output.getvalue()), inbox_payload())
+
     def test_human_item_output_exposes_effective_completion_policy(self) -> None:
         for policy, expected in (
             ("receipt", "receipt"),
@@ -185,8 +479,8 @@ class CLIBehaviorTests(unittest.TestCase):
         self.assertEqual(client.calls[-1][2]["payload"],
                          {"status": "closed.handled", "expected_version": 1})
 
-    def test_release_version_is_0_6_5(self) -> None:
-        self.assertEqual(__version__, "0.6.5")
+    def test_release_version_is_0_6_6(self) -> None:
+        self.assertEqual(__version__, "0.6.6")
 
     def test_api_client_serializes_requests_and_rejects_bad_responses(self) -> None:
         client = APIClient(
@@ -550,6 +844,24 @@ class CLIBehaviorTests(unittest.TestCase):
                         "GET",
                         "/v1/projects/project%2Fone/inbox",
                         {"query": {"after": 6, "limit": 7, "wait": 8}},
+                    ),
+                ),
+                (
+                    [
+                        "wait",
+                        "--project",
+                        project,
+                        "--after",
+                        "6",
+                        "--limit",
+                        "7",
+                        "--timeout",
+                        "0",
+                    ],
+                    (
+                        "GET",
+                        "/v1/projects/project%2Fone/inbox",
+                        {"query": {"after": 6, "limit": 7, "wait": 0}},
                     ),
                 ),
                 (
