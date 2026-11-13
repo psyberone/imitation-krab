@@ -7,10 +7,12 @@ import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import closing, redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
+from imitation_krab.cli import _run_client, build_parser
 from imitation_krab.config import MAX_LONG_POLL_SECONDS, MAX_QUEUE_LIMIT
 from imitation_krab.db import SCHEMA_VERSION, Database, DatabaseError
 from imitation_krab.service import Service, ServiceError
@@ -87,6 +89,47 @@ class ServiceFixture(unittest.TestCase):
 
 
 class ServiceTests(ServiceFixture):
+    def test_send_body_sources_preserve_server_utf8_byte_limit(self) -> None:
+        for multibyte, boundary_body in (
+            (False, ("a" * 1023 + "\n") * 16),
+            (True, ("é" * 1023 + "\n") * 8 + "a" * 8),
+        ):
+            for size in (16383, 16384, 16385):
+                body = boundary_body[:-1] if size == 16383 else boundary_body
+                if size == 16385:
+                    body += "a"
+                for source in ("--body", "--body-file"):
+                    with self.subTest(multibyte=multibyte, size=size, source=source):
+                        self.assertEqual(len(body.encode("utf-8")), size)
+                        body_file = Path(self.temporary.name) / "body.txt"
+                        body_file.write_text(body, encoding="utf-8")
+                        args = build_parser().parse_args([
+                            "--json", "send", "--project", "project-one",
+                            "--session", self.session_id, "--to", "bob",
+                            "--title", "Boundary", source,
+                            str(body_file) if source == "--body-file" else body,
+                        ])
+
+                        request_key = f"boundary-{multibyte}-{size}-{source}"
+
+                        def request(method, path, *, payload, key=request_key):
+                            return self.service.create_item(
+                                self.alice, "project-one", self.session_id,
+                                payload, key,
+                            ).payload
+
+                        with patch("imitation_krab.cli.APIClient") as client:
+                            client.request.side_effect = request
+                            with redirect_stdout(StringIO()):
+                                if size > 16384:
+                                    with self.assertRaises(ServiceError) as caught:
+                                        _run_client(args, client)
+                                    self.assertEqual(caught.exception.status, 400)
+                                    self.assertEqual(str(caught.exception), "body exceeds 16384 UTF-8 bytes")
+                                else:
+                                    self.assertEqual(_run_client(args, client), 0)
+                                    self.assertEqual(client.request.call_args.kwargs["payload"]["body"], body)
+
     def test_competing_claims_have_exactly_one_winner(self) -> None:
         claim_id = self.create_claim(
             external_id="owner/repository#race", key="create-race-claim-0001"

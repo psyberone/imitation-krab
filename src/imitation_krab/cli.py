@@ -22,7 +22,10 @@ from .config import (
     CONTAINER_HOST,
     DEFAULT_HOST,
     DEFAULT_PORT,
+    MAX_BODY_BYTES,
     MAX_CLAIM_IMPORT_ENTRIES,
+    MAX_LONG_POLL_SECONDS,
+    MAX_QUEUE_LIMIT,
     MAX_REQUEST_BYTES,
     default_db_path,
     default_pepper_path,
@@ -65,6 +68,8 @@ class ServerUnavailable(ClientError):
 
 SERVER_VERSION_RE = re.compile(r"\A[0-9A-Za-z][0-9A-Za-z.+-]{0,63}\Z")
 WATCH_RETRY_SECONDS = (1, 2, 4, 8, 15)
+WAIT_DEFAULT_SECONDS = 60 * 60
+WAIT_MAX_SECONDS = 24 * 60 * 60
 
 
 def _server_address(base_url: str) -> tuple[str, int]:
@@ -380,11 +385,15 @@ def build_parser() -> argparse.ArgumentParser:
     sessions.add_argument("--project", required=True)
 
     session_create = sub.add_parser(
-        "session-create", help="create a scoped work session"
+        "session-create", help="create a scoped work session with participant handles"
     )
     session_create.add_argument("--project", required=True)
     session_create.add_argument("--label", required=True)
-    session_create.add_argument("--participant", action="append", required=True)
+    session_create.add_argument(
+        "--participant", metavar="HANDLE", type=_participant_handle,
+        action="append", required=True,
+        help="project member handle (not a usr_... ID); repeat for each participant",
+    )
 
     session_close = sub.add_parser(
         "session-close", help="close an empty/completed session"
@@ -399,7 +408,9 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--to", required=True)
     send.add_argument("--title", required=True)
     send.add_argument("--claim", help="immutably link an issue or pull-request claim")
-    send.add_argument("--completion-policy", choices=("workflow", "receipt"), default="workflow")
+    send.add_argument(
+        "--completion-policy", choices=("workflow", "receipt"), default="workflow"
+    )
     _add_text_source(send, "body", required=True)
 
     queue = sub.add_parser("queue", help="read the authenticated user's private queue")
@@ -425,6 +436,28 @@ def build_parser() -> argparse.ArgumentParser:
     inbox_wait = inbox.add_mutually_exclusive_group()
     inbox_wait.add_argument("--watch", action="store_true")
     inbox_wait.add_argument("--wait", type=int, default=0)
+
+    wait = sub.add_parser(
+        "wait", help="block until one private project inbox event arrives"
+    )
+    wait.add_argument("--project", required=True)
+    wait.add_argument("--after", metavar="SEQ", type=_wait_cursor, required=True)
+    wait.add_argument(
+        "--timeout",
+        metavar="SECONDS",
+        type=_wait_timeout,
+        default=WAIT_DEFAULT_SECONDS,
+        help=(
+            f"overall wait in seconds (default {WAIT_DEFAULT_SECONDS}; "
+            f"maximum {WAIT_MAX_SECONDS})"
+        ),
+    )
+    wait.add_argument(
+        "--limit",
+        type=_wait_limit,
+        default=50,
+        help=f"maximum events returned (default 50; maximum {MAX_QUEUE_LIMIT})",
+    )
 
     inbox_ack = sub.add_parser(
         "inbox-ack", help="explicitly advance the durable project inbox cursor"
@@ -491,12 +524,56 @@ def _add_mutation_retry_arg(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _participant_handle(value: str) -> str:
+    if value.startswith("usr_"):
+        raise argparse.ArgumentTypeError(
+            "use the project member's handle (for example, alice), not a usr_... ID"
+        )
+    return value
+
+
+def _bounded_cli_integer(
+    value: str, *, name: str, minimum: int, maximum: int | None = None
+) -> int:
+    try:
+        parsed = int(value, 10)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{name} must be an integer") from exc
+    if parsed < minimum or (maximum is not None and parsed > maximum):
+        if maximum is None:
+            requirement = f"at least {minimum}"
+        else:
+            requirement = f"between {minimum} and {maximum}"
+        raise argparse.ArgumentTypeError(f"{name} must be {requirement}")
+    return parsed
+
+
+def _wait_cursor(value: str) -> int:
+    return _bounded_cli_integer(value, name="after", minimum=0)
+
+
+def _wait_timeout(value: str) -> int:
+    return _bounded_cli_integer(
+        value, name="timeout", minimum=0, maximum=WAIT_MAX_SECONDS
+    )
+
+
+def _wait_limit(value: str) -> int:
+    return _bounded_cli_integer(value, name="limit", minimum=1, maximum=MAX_QUEUE_LIMIT)
+
+
 def _add_text_source(
     parser: argparse.ArgumentParser, name: str, *, required: bool
 ) -> None:
     group = parser.add_mutually_exclusive_group(required=required)
-    group.add_argument(f"--{name}")
-    group.add_argument(f"--{name}-file", type=Path)
+    limit = (
+        f" (maximum {MAX_BODY_BYTES // 1024} KiB / {MAX_BODY_BYTES} UTF-8 bytes)"
+        if name == "body" else ""
+    )
+    group.add_argument(f"--{name}", help=f"{name} text{limit}")
+    group.add_argument(
+        f"--{name}-file", type=Path, help=f"read {name} text from a UTF-8 file{limit}"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -830,6 +907,15 @@ def _run_client(args: argparse.Namespace, client: APIClient) -> int:
             first = False
             if not args.watch:
                 break
+    elif command == "wait":
+        result = _wait_for_inbox(
+            client,
+            project=args.project,
+            after=args.after,
+            limit=args.limit,
+            timeout=args.timeout,
+        )
+        _emit(args, result, kind="queue")
     elif command == "inbox-ack":
         result = client.request(
             "POST",
@@ -887,6 +973,53 @@ def _watch_request(
         if failures:
             _safe_notice("notice", "watch resumed")
         return result
+
+
+def _wait_for_inbox(
+    client: APIClient,
+    *,
+    project: str,
+    after: int,
+    limit: int,
+    timeout: int,
+) -> dict[str, Any]:
+    path = f"/v1/projects/{_segment(project)}/inbox"
+    deadline = time.monotonic() + timeout
+    failures = 0
+    while True:
+        remaining = max(0.0, deadline - time.monotonic())
+        poll_seconds = min(MAX_LONG_POLL_SECONDS, int(remaining))
+        query = {"after": after, "limit": limit, "wait": poll_seconds}
+        try:
+            result = client.request("GET", path, query=query)
+        except ServerUnavailable as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            delay = min(
+                float(WATCH_RETRY_SECONDS[min(failures, len(WATCH_RETRY_SECONDS) - 1)]),
+                remaining,
+            )
+            failures += 1
+            _safe_notice(
+                "warning",
+                f"wait disconnected; retrying in {delay:g}s: {exc}",
+            )
+            time.sleep(delay)
+            if time.monotonic() >= deadline:
+                raise
+            continue
+
+        if failures:
+            _safe_notice("notice", "wait resumed")
+            failures = 0
+        if result.get("events") or timeout == 0 or time.monotonic() >= deadline:
+            return result
+
+        remaining = deadline - time.monotonic()
+        if remaining < 1:
+            time.sleep(max(0.0, remaining))
+            return result
 
 
 def _scope_path(args: argparse.Namespace) -> str:
