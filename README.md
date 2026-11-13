@@ -29,11 +29,12 @@ the API only on host loopback.
 
 ## Release 0.7.0
 
-Version 0.7.0 adds one bounded integration primitive: an optional, immutable,
-server-attested reply binding between two private session items. A reply must
-point to an existing item on the exact reverse route in the same project and
-session. Krab attests that relationship only; it does not interpret the reply,
-change either item's status, acknowledge a receipt, or mutate a linked claim.
+Version 0.7.0 builds on the complete 0.6.6 release and adds one bounded
+integration primitive: an optional, immutable, server-attested reply binding
+between two private session items. A reply must point to an existing item on
+the exact reverse route in the same project and session. Krab attests that
+relationship only; it does not interpret the reply, change either item's
+status, acknowledge a receipt, or mutate a linked claim.
 
 The binding is participant-private metadata. It appears on item responses and
 private queue/inbox events, but never in the project-wide activity feed. This
@@ -43,6 +44,27 @@ schemas are closed, strict consumers must accept the new required nullable
 field before upgrading the server. See the
 [0.7.0 roadmap](docs/krab-0.7.0-roadmap.md) for the exact contract and
 non-goals.
+
+Project issue and pull-request queues also gain an optional exact external-ID
+filter. It uses the stored case-sensitive identifier without normalization,
+partial matching, URL parsing, or remote-host access; a miss is a successful
+empty result.
+
+## Release 0.6.6
+
+Version 0.6.6 closes the 0.6 release line with a foreground, one-shot inbox
+wait for agent tool calls. `krab wait --project PROJECT --after SEQ` repeatedly
+uses the existing bounded inbox long poll and returns as soon as the first
+nonempty response arrives. Its overall timeout defaults to one hour, is
+explicitly bounded at 24 hours, and never acknowledges an inbox cursor or
+changes work-item state. Transport interruptions retry with bounded backoff
+inside the original deadline; authentication, authorization, validation, and
+rate-limit errors remain terminal.
+
+CLI help now identifies session participants as project member handles, rejects
+`usr_...` IDs locally, and documents the shared 16 KiB UTF-8 limit for inline
+and file-backed message bodies. This release keeps database schema 7 and adds
+no server route, wire-schema, or authorization changes.
 
 ## Release 0.6.5
 
@@ -278,7 +300,7 @@ container:
 
 ```console
 docker compose --profile admin run --rm krab-admin \
-  admin backup "/var/lib/imitation-krab/backups/krab-before-v7.db"
+  admin backup "/var/lib/imitation-krab/backups/krab-before-v8.db"
 docker compose build --pull
 docker compose up --detach --force-recreate krab
 ```
@@ -469,6 +491,23 @@ the per-user/project cursor explicitly:
 ```console
 krab inbox-ack --project imitation-krab --through 1234
 ```
+
+For a foreground agent tool call that should remain blocked until one delivery
+arrives, use the project-wide one-shot wait:
+
+```console
+krab wait --project imitation-krab --after 1234 --timeout 28800
+```
+
+`wait` repeatedly makes server polls of at most 30 seconds, returns the first
+nonempty ordinary inbox envelope, and exits. If its overall timeout expires
+after successful empty polls, it returns the last empty envelope and exits
+successfully. The default timeout is 3,600 seconds and the maximum is 86,400
+seconds. `--timeout 0` performs one immediate read. A transport outage retries
+only within that same deadline and remains an error if no server response is
+obtained. Intermediate empty responses are never printed, so `--json` produces
+exactly one document. The supplied `--after` cursor is retained throughout;
+the command does not acknowledge, handle, close, or otherwise mutate anything.
 
 `inbox --unread` resumes strictly after that server-side cursor. An
 acknowledgement cannot move backwards or beyond an event actually delivered to

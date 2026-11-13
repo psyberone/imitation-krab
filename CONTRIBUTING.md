@@ -44,6 +44,26 @@ python3 -m venv .venv
 Do not put development databases, pepper files, tokens, or exported backups in
 the repository.
 
+## Branch roles
+
+Release branches are authoritative for stability and deployment. `main` is an
+unstable integration branch; do not use it as a production baseline, a
+compatibility target, or the source of a deployment merely because it contains
+a merged release.
+
+The current lanes are:
+
+- `0.6.6` is the stable 0.6 release branch.
+- `0.7.0` is the active development branch until its release is explicitly
+  approved.
+- `main` may contain integrated release work but carries no stability promise.
+
+Base maintenance work on the applicable stable release branch. Bring a stable
+baseline into a later development lane by merging the named release branch,
+not `main`. Target feature and release-candidate pull requests at their named
+development release branch. A development branch becomes stable only after its
+verification, release decision, and deployment are complete.
+
 ## Tests and verification
 
 Run the complete suite from the repository root:

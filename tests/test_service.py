@@ -164,10 +164,12 @@ class ServiceTests(ServiceFixture):
                             str(body_file) if source == "--body-file" else body,
                         ])
 
-                        def request(method, path, *, payload):
+                        request_key = f"boundary-{multibyte}-{size}-{source}"
+
+                        def request(method, path, *, payload, key=request_key):
                             return self.service.create_item(
                                 self.alice, "project-one", self.session_id,
-                                payload, f"boundary-{multibyte}-{size}-{source}",
+                                payload, key,
                             ).payload
 
                         with patch("imitation_krab.cli.APIClient") as client:

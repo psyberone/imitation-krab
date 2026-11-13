@@ -1,8 +1,9 @@
 # Krab 0.7.0 MGB integration roadmap
 
-- **Status:** reply binding and the 0.6.5 hardening baseline are merged and
-  verified on the `0.7.0` branch; release deployment remains
-- **Baseline:** version 0.6.5 / schema 7
+- **Status:** reply binding and the complete 0.6.6 baseline are integrated on
+  the `0.7.0` branch and undergoing release-candidate verification; deployment
+  remains held
+- **Baseline:** version 0.6.6 / schema 7
 - **Release purpose:** provide the smallest server-attested transport relation
   needed for Magic Glass Box interactions without importing orchestration
   policy into Krab
